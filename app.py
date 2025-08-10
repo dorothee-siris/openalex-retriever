@@ -99,23 +99,25 @@ def load_institutions():
         return None
 
 def search_institutions(df, query):
-    """Search institutions by name, alternatives, or acronyms"""
+    """Search institutions by name, alternatives, acronyms, and city"""
     if not query or len(query) < 2:
         return pd.DataFrame()
     
     query_lower = query.lower()
     
-    # Search in display_name, alternatives, and acronyms
+    # Search in display_name, alternatives, acronyms, AND city
     mask = (
         df['display_name'].str.lower().str.contains(query_lower, na=False) |
         df['display_name_alternatives'].str.lower().str.contains(query_lower, na=False) |
-        df['display_name_acronyms'].str.lower().str.contains(query_lower, na=False)
+        df['display_name_acronyms'].str.lower().str.contains(query_lower, na=False) |
+        df['city'].str.lower().str.contains(query_lower, na=False)
     )
     
-    results = df[mask].head(20)  # Limit to 20 results
+    results = df[mask].head(30)  # Increased to 30 results for better selection
     
-    # Prepare display dataframe
+    # Prepare display dataframe with Select column
     display_df = pd.DataFrame({
+        'Select': False,  # Checkbox column
         'Name': results['display_name'],
         'Acronym': results['display_name_acronyms'],
         'Type': results['type'],
@@ -487,56 +489,108 @@ def main():
     # Phase 1: Institution Selection
     st.header("1️⃣ Select Institutions")
     
-    col1, col2 = st.columns([2, 1])
+    # Search input
+    search_query = st.text_input("Search institutions by name, acronym, alternative names, or city:", 
+                                placeholder="Type at least 2 characters to search...")
     
-    with col1:
-        search_query = st.text_input("Search institutions by name, acronym, or alternative names:", 
-                                    placeholder="Type at least 2 characters...")
+    # Full width layout for results
+    if search_query:
+        results_df = search_institutions(institutions_df, search_query)
         
-        if search_query:
-            results_df = search_institutions(institutions_df, search_query)
+        if not results_df.empty:
+            st.info(f"📊 Found {len(results_df)} matching institutions. Select up to {10 - len(st.session_state.selected_institutions)} more institutions.")
             
-            if not results_df.empty:
-                st.dataframe(results_df.drop(columns=['openalex_id']), use_container_width=True)
-                
-                selected_indices = st.multiselect(
-                    "Select institutions to add (max 10):",
-                    options=results_df.index,
-                    format_func=lambda x: results_df.loc[x, 'Name']
-                )
-                
-                if st.button("Add Selected Institutions"):
-                    for idx in selected_indices:
-                        inst_data = {
-                            'openalex_id': results_df.loc[idx, 'openalex_id'],
-                            'display_name': results_df.loc[idx, 'Name']
-                        }
+            # Use st.data_editor for interactive selection with checkboxes
+            edited_df = st.data_editor(
+                results_df.drop(columns=['openalex_id']),
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Select": st.column_config.CheckboxColumn(
+                        "Select",
+                        help="Check to add institution to selection",
+                        default=False,
+                        width="small"
+                    ),
+                    "Name": st.column_config.TextColumn(
+                        "Institution Name",
+                        width="large"
+                    ),
+                    "ROR": st.column_config.LinkColumn(
+                        "ROR",
+                        width="medium"
+                    ),
+                    "Total Works": st.column_config.NumberColumn(
+                        "Total Works",
+                        format="%d",
+                        width="small"
+                    ),
+                    "Avg. Works/Year": st.column_config.NumberColumn(
+                        "Avg. Works/Year",
+                        format="%.1f",
+                        width="small"
+                    )
+                },
+                disabled=["Name", "Acronym", "Type", "Country", "City", "ROR", "Total Works", "Avg. Works/Year"],
+                key="institution_selector"
+            )
+            
+            # Add selected institutions button
+            col1, col2 = st.columns([1, 5])
+            with col1:
+                if st.button("➕ Add Selected", type="primary"):
+                    # Get selected rows
+                    selected_rows = edited_df[edited_df['Select'] == True]
+                    
+                    if not selected_rows.empty:
+                        added_count = 0
+                        for idx, row in selected_rows.iterrows():
+                            inst_data = {
+                                'openalex_id': results_df.loc[idx, 'openalex_id'],
+                                'display_name': row['Name']
+                            }
+                            
+                            # Check if not already added and limit not reached
+                            if len(st.session_state.selected_institutions) < 10:
+                                if not any(i['openalex_id'] == inst_data['openalex_id'] 
+                                         for i in st.session_state.selected_institutions):
+                                    st.session_state.selected_institutions.append(inst_data)
+                                    added_count += 1
                         
-                        # Check if not already added and limit not reached
-                        if len(st.session_state.selected_institutions) < 10:
-                            if not any(i['openalex_id'] == inst_data['openalex_id'] 
-                                     for i in st.session_state.selected_institutions):
-                                st.session_state.selected_institutions.append(inst_data)
-                                st.rerun()
-    
-    with col2:
-        st.subheader(f"Selected Institutions ({len(st.session_state.selected_institutions)}/10)")
-        
-        if st.session_state.selected_institutions:
-            for i, inst in enumerate(st.session_state.selected_institutions):
-                col_a, col_b = st.columns([4, 1])
-                with col_a:
-                    st.text(f"{i+1}. {inst['display_name'][:40]}...")
-                with col_b:
-                    if st.button("❌", key=f"remove_{i}"):
-                        st.session_state.selected_institutions.pop(i)
-                        st.rerun()
-            
-            if st.button("Clear All"):
-                st.session_state.selected_institutions = []
-                st.rerun()
+                        if added_count > 0:
+                            st.success(f"Added {added_count} institution(s)")
+                            st.rerun()
+                        else:
+                            st.warning("All selected institutions are already in your list or limit reached")
+                    else:
+                        st.warning("Please select at least one institution")
         else:
-            st.info("No institutions selected yet")
+            st.info("No institutions found matching your search")
+    
+    # Display selected institutions in a more compact sidebar-like section
+    st.divider()
+    
+    # Selected institutions display
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        st.subheader(f"📋 Selected Institutions ({len(st.session_state.selected_institutions)}/10)")
+    with col3:
+        if st.session_state.selected_institutions and st.button("🗑️ Clear All"):
+            st.session_state.selected_institutions = []
+            st.rerun()
+    
+    if st.session_state.selected_institutions:
+        # Display selected institutions in a clean format
+        for i, inst in enumerate(st.session_state.selected_institutions):
+            col1, col2 = st.columns([11, 1])
+            with col1:
+                st.write(f"**{i+1}.** {inst['display_name']}")
+            with col2:
+                if st.button("❌", key=f"remove_{i}", help=f"Remove {inst['display_name']}"):
+                    st.session_state.selected_institutions.pop(i)
+                    st.rerun()
+    else:
+        st.info("No institutions selected yet. Search and select institutions above.")
     
     if not st.session_state.selected_institutions:
         st.warning("Please select at least one institution to continue")
