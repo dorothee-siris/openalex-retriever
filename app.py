@@ -647,7 +647,18 @@ def main():
         st.session_state.doc_types_state = {doc_type: True for doc_type in DOCUMENT_TYPES}
         st.session_state.all_works = True
     
-    all_works = st.checkbox("All Works (no document type filtering - faster)", value=st.session_state.all_works)
+    # Add Select All / Unselect All buttons
+    col1, col2, col3 = st.columns([3, 1, 1])
+    with col1:
+        all_works = st.checkbox("All Works (no document type filtering - faster)", value=st.session_state.all_works)
+    with col2:
+        if st.button("Select All", key="select_all_docs", disabled=all_works):
+            st.session_state.doc_types_state = {doc_type: True for doc_type in DOCUMENT_TYPES}
+            st.rerun()
+    with col3:
+        if st.button("Unselect All", key="unselect_all_docs", disabled=all_works):
+            st.session_state.doc_types_state = {doc_type: False for doc_type in DOCUMENT_TYPES}
+            st.rerun()
     
     # Update session state when All Works changes
     if all_works != st.session_state.all_works:
@@ -683,7 +694,19 @@ def main():
         st.session_state.metadata_state = {field: True for field in METADATA_FIELDS.keys()}
         st.session_state.all_metadata = True
     
-    all_metadata = st.checkbox("All Metadata Fields", value=st.session_state.all_metadata)
+    # Add Select All / Unselect All buttons
+    col1, col2, col3 = st.columns([3, 1, 1])
+    with col1:
+        all_metadata = st.checkbox("All Metadata Fields", value=st.session_state.all_metadata)
+    with col2:
+        if st.button("Select All", key="select_all_meta", disabled=all_metadata):
+            st.session_state.metadata_state = {field: True for field in METADATA_FIELDS.keys()}
+            st.rerun()
+    with col3:
+        if st.button("Unselect All", key="unselect_all_meta", disabled=all_metadata):
+            # Keep ID always selected
+            st.session_state.metadata_state = {field: (field == "id") for field in METADATA_FIELDS.keys()}
+            st.rerun()
     
     # Update session state when All Metadata changes
     if all_metadata != st.session_state.all_metadata:
