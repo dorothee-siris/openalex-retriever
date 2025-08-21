@@ -782,7 +782,7 @@ def main():
         
         all_publications = []
         
-        # Process each institution
+        # Process each institution (collect all publications first, no deduplication yet)
         for i, inst in enumerate(st.session_state.selected_institutions):
             st.session_state.progress_data['current_institution'] = i + 1
             
@@ -807,31 +807,46 @@ def main():
                 status_placeholder
             )
             
+            # Just append all publications without deduplication
             all_publications.extend(institution_pubs)
-            st.session_state.progress_data['publications_fetched'] = len(all_publications)
             
             # Update metrics
             metrics_placeholder.metric(
                 label="Progress",
                 value=f"{i+1}/{len(st.session_state.selected_institutions)} institutions",
-                delta=f"{len(all_publications)} publications fetched"
+                delta=f"{len(all_publications)} publications fetched (before deduplication)"
             )
         
-        # Merge duplicates
+        # NOW do deduplication only once at the end
         if all_publications:
+            status_placeholder.info("Deduplicating publications and merging institution names...")
+            
             pub_dict = {}
             for pub in all_publications:
                 pub_id = pub.get("id", "")
                 if pub_id:
                     if pub_id not in pub_dict:
+                        # First occurrence of this publication
                         pub_dict[pub_id] = pub
                     else:
+                        # Publication already exists, merge institution names
                         existing_institutions = pub_dict[pub_id].get("institutions_extracted", "")
                         new_institution = pub.get("institutions_extracted", "")
-                        if new_institution and new_institution not in existing_institutions:
-                            pub_dict[pub_id]["institutions_extracted"] = f"{existing_institutions} | {new_institution}" if existing_institutions else new_institution
+                        
+                        if new_institution:
+                            # Build a set to avoid duplicates, then join
+                            existing_set = set(inst.strip() for inst in existing_institutions.split(" | ") if inst.strip())
+                            existing_set.add(new_institution)
+                            pub_dict[pub_id]["institutions_extracted"] = " | ".join(sorted(existing_set))
             
             merged_publications = list(pub_dict.values())
+            
+            # Update final metrics
+            metrics_placeholder.metric(
+                label="Final Results",
+                value=f"{len(merged_publications)} unique publications",
+                delta=f"Removed {len(all_publications) - len(merged_publications)} duplicates"
+            )
             
             # Create CSV
             df_output = pd.DataFrame(merged_publications)
