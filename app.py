@@ -21,7 +21,7 @@ DOCUMENT_TYPES = [
     "supplementary-materials", "retraction"
 ]
 
-# Metadata fields
+# Metadata fields with updated naming
 METADATA_FIELDS = {
     # Core Publication Information
     "id": "OpenAlex ID",
@@ -66,12 +66,11 @@ METADATA_FIELDS = {
     "counts_by_year": "Citations per Year",
     
     # Classification Information
-    "primary_topic.display_name": "Primary Topic",
-    "primary_topic.score": "Primary Topic Score",
+    "primary_topic_and_score": "Primary Topic and Score",
     "primary_topic.subfield.display_name": "Primary Subfield",
     "primary_topic.field.display_name": "Primary Field", 
     "primary_topic.domain.display_name": "Primary Domain",
-    "topics": "Topics",
+    "topics": "All Topics",
     "concepts": "Concepts",
     
     # Additional Information
@@ -113,7 +112,7 @@ def search_institutions(df, query):
         df['city'].str.lower().str.contains(query_lower, na=False)
     )
     
-    results = df[mask].head(30)  # Increased to 30 results for better selection
+    results = df[mask]  # No limit - show all matching results
     
     # Prepare display dataframe with Select column
     display_df = pd.DataFrame({
@@ -212,7 +211,7 @@ def format_authors_simple(authorships):
     return " | ".join(authors)
 
 def format_institutions(authorships):
-    """Format institutions information"""
+    """Format institutions information with semicolon separator"""
     if not authorships:
         return ""
     
@@ -229,14 +228,14 @@ def format_institutions(authorships):
                 inst_country = inst.get("country_code", "Unknown")
                 inst_id_clean = inst_id.replace("https://openalex.org/", "")
                 
-                formatted_inst = f"{inst_name}, {inst_type}, {inst_country} ({inst_id_clean})"
+                formatted_inst = f"{inst_name} ; {inst_type} ; {inst_country} ({inst_id_clean})"
                 unique_institutions[inst_id] = formatted_inst
                 institution_order.append(inst_id)
     
     return " | ".join([unique_institutions[inst_id] for inst_id in institution_order])
 
 def format_raw_affiliation_strings(authorships):
-    """Format raw affiliation strings"""
+    """Format raw affiliation strings with better separator"""
     if not authorships:
         return ""
     
@@ -266,7 +265,7 @@ def format_counts_by_year(counts):
     return " | ".join(formatted_counts)
 
 def format_topic_and_score(topics):
-    """Format topics with scores"""
+    """Format topics with scores using semicolon separator"""
     if not topics:
         return ""
     
@@ -274,12 +273,12 @@ def format_topic_and_score(topics):
     for topic in topics:
         display_name = topic.get("display_name", "Unknown")
         score = topic.get("score", 0)
-        formatted_topics.append(f"{display_name}, {score:.4f}")
+        formatted_topics.append(f"{display_name} ; {score:.4f}")
     
     return " | ".join(formatted_topics)
 
 def format_concepts(concepts):
-    """Format concepts by level"""
+    """Format concepts by level with semicolon separator"""
     if not concepts:
         return ""
     
@@ -291,7 +290,7 @@ def format_concepts(concepts):
         
         display_name = concept.get("display_name", "Unknown")
         score = concept.get("score", 0)
-        concepts_by_level[level].append(f"{display_name}, {score:.4f} (level {level})")
+        concepts_by_level[level].append(f"{display_name} ; {score:.4f} (level {level})")
     
     formatted_concepts = []
     for level in sorted(concepts_by_level.keys()):
@@ -300,7 +299,7 @@ def format_concepts(concepts):
     return " | ".join(formatted_concepts)
 
 def format_sdgs(sdgs):
-    """Format SDGs"""
+    """Format SDGs with semicolon separator"""
     if not sdgs:
         return ""
     
@@ -308,7 +307,7 @@ def format_sdgs(sdgs):
     for sdg in sdgs:
         display_name = sdg.get("display_name", "Unknown")
         score = sdg.get("score", 0)
-        formatted_sdgs.append(f"{display_name}, {score:.2f}")
+        formatted_sdgs.append(f"{display_name} ; {score:.2f}")
     
     return " | ".join(formatted_sdgs)
 
@@ -350,6 +349,14 @@ def process_publications(results, institution_id, institution_name, selected_met
                 value = format_institutions(pub.get("authorships", []))
             elif field == "raw_affiliation_strings":
                 value = format_raw_affiliation_strings(pub.get("authorships", []))
+            elif field == "primary_topic_and_score":
+                # Combine primary topic name and score
+                topic_name = get_value_from_nested_dict(pub, "primary_topic.display_name")
+                topic_score = get_value_from_nested_dict(pub, "primary_topic.score")
+                if topic_name and topic_score is not None:
+                    value = f"{topic_name} ; {topic_score:.4f}"
+                else:
+                    value = ""
             elif field.startswith("primary_location.source.issn"):
                 issns = get_value_from_nested_dict(pub, "primary_location.source.issn") or []
                 value = ",".join(issns)
@@ -580,6 +587,25 @@ def main():
             st.rerun()
     
     if st.session_state.selected_institutions:
+        # Calculate total estimated publications per year
+        total_avg_works = 0
+        for inst in st.session_state.selected_institutions:
+            # Find the institution in the dataframe to get avg_works_per_year
+            inst_data = institutions_df[institutions_df['openalex_id'] == inst['openalex_id']]
+            if not inst_data.empty:
+                avg_works = inst_data.iloc[0]['avg_works_per_year_2021_2023']
+                if pd.notna(avg_works):
+                    total_avg_works += avg_works
+        
+        # Display estimation warning
+        if len(st.session_state.selected_institutions) == 1:
+            st.markdown(f"<p style='color: red;'>This institution produces an estimation of <b>{total_avg_works:.0f}</b> publications per year (all document types).</p>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"<p style='color: red;'>These institutions produce an estimation of <b>{total_avg_works:.0f}</b> publications per year (all document types).</p>", unsafe_allow_html=True)
+        
+        # Store in session state for later use
+        st.session_state.total_avg_works_per_year = total_avg_works
+        
         # Display selected institutions in a clean format
         for i, inst in enumerate(st.session_state.selected_institutions):
             col1, col2 = st.columns([11, 1])
@@ -591,6 +617,7 @@ def main():
                     st.rerun()
     else:
         st.info("No institutions selected yet. Search and select institutions above.")
+        st.session_state.total_avg_works_per_year = 0
     
     if not st.session_state.selected_institutions:
         st.warning("Please select at least one institution to continue")
@@ -601,31 +628,69 @@ def main():
     # Phase 2: Configure Retrieval Parameters
     st.header("2️⃣ Configure Retrieval Parameters")
     
-    # Timeframe
-    col1, col2, col3 = st.columns(3)
+    # Timeframe and output format
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         start_year = st.number_input("Start Year", min_value=1970, max_value=CURRENT_YEAR, value=CURRENT_YEAR-5)
     with col2:
         end_year = st.number_input("End Year", min_value=1970, max_value=CURRENT_YEAR, value=CURRENT_YEAR)
     with col3:
         language_filter = st.radio("Language Filter", ["All Languages", "English Only"])
+    with col4:
+        output_format = st.radio("Output Format", ["CSV", "Parquet"], help="Parquet format provides better compression for large files")
     
     # Document Types
     st.subheader("Document Types")
-    all_works = st.checkbox("All Works (no document type filtering - faster)")
     
-    if not all_works:
-        doc_cols = st.columns(5)
-        selected_doc_types = []
-        for i, doc_type in enumerate(DOCUMENT_TYPES):
-            with doc_cols[i % 5]:
-                if st.checkbox(doc_type, value=(doc_type == "article")):
+    # Initialize session state for document types if not exists
+    if 'doc_types_state' not in st.session_state:
+        st.session_state.doc_types_state = {doc_type: True for doc_type in DOCUMENT_TYPES}
+        st.session_state.all_works = True
+    
+    all_works = st.checkbox("All Works (no document type filtering - faster)", value=st.session_state.all_works)
+    
+    # Update session state when All Works changes
+    if all_works != st.session_state.all_works:
+        st.session_state.all_works = all_works
+        if all_works:
+            # Check all document types when All Works is selected
+            st.session_state.doc_types_state = {doc_type: True for doc_type in DOCUMENT_TYPES}
+    
+    # Always show document type checkboxes
+    doc_cols = st.columns(5)
+    selected_doc_types = []
+    
+    for i, doc_type in enumerate(DOCUMENT_TYPES):
+        with doc_cols[i % 5]:
+            # If All Works is checked, show types as checked but disabled
+            if all_works:
+                checked = st.checkbox(doc_type, value=True, disabled=True, key=f"doc_{doc_type}")
+            else:
+                checked = st.checkbox(doc_type, value=st.session_state.doc_types_state.get(doc_type, False), key=f"doc_{doc_type}")
+                st.session_state.doc_types_state[doc_type] = checked
+                if checked:
                     selected_doc_types.append(doc_type)
-    else:
+    
+    # If All Works is selected, use empty list (no filtering)
+    if all_works:
         selected_doc_types = []
     
     # Metadata Fields
     st.subheader("Metadata Fields")
+    
+    # Initialize session state for metadata if not exists
+    if 'metadata_state' not in st.session_state:
+        st.session_state.metadata_state = {field: True for field in METADATA_FIELDS.keys()}
+        st.session_state.all_metadata = True
+    
+    all_metadata = st.checkbox("All Metadata Fields", value=st.session_state.all_metadata)
+    
+    # Update session state when All Metadata changes
+    if all_metadata != st.session_state.all_metadata:
+        st.session_state.all_metadata = all_metadata
+        if all_metadata:
+            # Check all metadata fields when All Metadata is selected
+            st.session_state.metadata_state = {field: True for field in METADATA_FIELDS.keys()}
     
     metadata_categories = {
         "Core Publication Information": ["id", "doi", "display_name", "publication_year", "publication_date", 
@@ -639,27 +704,61 @@ def main():
         "Impact Metrics": ["fwci", "cited_by_count", "citation_normalized_percentile.value",
                           "citation_normalized_percentile.is_in_top_1_percent", 
                           "citation_normalized_percentile.is_in_top_10_percent", "counts_by_year"],
-        "Classification Information": ["primary_topic.display_name", "primary_topic.score", 
-                                      "primary_topic.subfield.display_name", "primary_topic.field.display_name",
-                                      "primary_topic.domain.display_name", "topics", "concepts"],
+        "Classification Information": ["primary_topic_and_score", "primary_topic.subfield.display_name", 
+                                      "primary_topic.field.display_name", "primary_topic.domain.display_name",
+                                      "topics", "concepts"],
         "Additional Information": ["sustainable_development_goals", "grants", "datasets"]
     }
     
     selected_metadata = ["id"]  # Always include ID
     
+    # Always show all metadata fields
     for category, fields in metadata_categories.items():
-        with st.expander(category):
+        with st.expander(category, expanded=True):
             field_cols = st.columns(3)
             for i, field in enumerate(fields):
                 with field_cols[i % 3]:
-                    if field != "id":  # ID is always selected
-                        if st.checkbox(METADATA_FIELDS.get(field, field), key=f"meta_{field}"):
+                    if field == "id":
+                        # ID is always selected and disabled
+                        st.checkbox(METADATA_FIELDS.get(field, field), value=True, disabled=True, key=f"meta_{field}")
+                    elif all_metadata:
+                        # If All Metadata is checked, show as checked but disabled
+                        st.checkbox(METADATA_FIELDS.get(field, field), value=True, disabled=True, key=f"meta_{field}")
+                        selected_metadata.append(field)
+                    else:
+                        # Normal checkbox behavior
+                        if st.checkbox(METADATA_FIELDS.get(field, field), 
+                                     value=st.session_state.metadata_state.get(field, False), 
+                                     key=f"meta_{field}"):
                             selected_metadata.append(field)
+                            st.session_state.metadata_state[field] = True
+                        else:
+                            st.session_state.metadata_state[field] = False
     
     st.divider()
     
     # Phase 3: Retrieve Publications
     st.header("3️⃣ Retrieve Publications")
+    
+    # Calculate estimated publications and show warning if needed
+    if hasattr(st.session_state, 'total_avg_works_per_year') and st.session_state.total_avg_works_per_year > 0:
+        years_span = end_year - start_year + 1
+        estimated_publications = st.session_state.total_avg_works_per_year * years_span
+        
+        if estimated_publications > 100000:
+            st.markdown(
+                f"<div style='background-color: #ffebee; padding: 10px; border-radius: 5px; border-left: 3px solid red;'>"
+                f"<p style='color: red; margin: 0;'><b>⚠️ Warning!</b> The file might contain more than <b>{estimated_publications:,.0f}</b> publications "
+                f"and exceed 200 MB. Consider:</p>"
+                f"<ul style='color: red; margin: 5px 0;'>"
+                f"<li>Filtering document types</li>"
+                f"<li>Selecting less metadata</li>"
+                f"<li>Removing abstracts (can save up to 40% of space)</li>"
+                f"<li>Choosing Parquet format for better compression</li>"
+                f"</ul></div>",
+                unsafe_allow_html=True
+            )
+            st.markdown("")  # Add spacing
     
     if st.button("🚀 Start Retrieval", type="primary"):
         # Initialize progress tracking
@@ -749,23 +848,44 @@ def main():
             # Generate filename
             num_institutions = len(st.session_state.selected_institutions)
             timestamp = datetime.now().strftime("%H%M")
-            filename = f"pubs_{num_institutions}_institutions_{timestamp}.csv"
             
-            # Convert to CSV
-            csv_buffer = io.StringIO()
-            df_output.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
-            csv_data = csv_buffer.getvalue()
-            
-            # Success message and download button
-            st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions")
-            
-            st.download_button(
-                label=f"📥 Download {filename}",
-                data=csv_data,
-                file_name=filename,
-                mime="text/csv",
-                type="primary"
-            )
+            if output_format == "CSV":
+                filename = f"pubs_{num_institutions}_institutions_{timestamp}.csv"
+                
+                # Convert to CSV with UTF-8 BOM for Excel compatibility
+                csv_buffer = io.StringIO()
+                df_output.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+                csv_data = csv_buffer.getvalue()
+                
+                # Success message and download button
+                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions")
+                
+                st.download_button(
+                    label=f"📥 Download {filename}",
+                    data=csv_data.encode('utf-8-sig'),  # Encode with BOM for Excel
+                    file_name=filename,
+                    mime="text/csv",
+                    type="primary"
+                )
+            else:  # Parquet format
+                filename = f"pubs_{num_institutions}_institutions_{timestamp}.parquet"
+                
+                # Convert to Parquet
+                parquet_buffer = io.BytesIO()
+                df_output.to_parquet(parquet_buffer, index=False, compression='snappy')
+                parquet_data = parquet_buffer.getvalue()
+                
+                # Success message and download button
+                file_size_mb = len(parquet_data) / (1024 * 1024)
+                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions (Parquet size: {file_size_mb:.1f} MB)")
+                
+                st.download_button(
+                    label=f"📥 Download {filename}",
+                    data=parquet_data,
+                    file_name=filename,
+                    mime="application/octet-stream",
+                    type="primary"
+                )
         else:
             st.warning("No publications found for the selected criteria")
 
