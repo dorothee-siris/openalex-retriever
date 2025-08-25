@@ -1001,45 +1001,35 @@ def main():
             if output_format == "CSV":
                 filename = f"pubs_{num_institutions}_institutions_{timestamp}.csv"
                 
-                # Convert to CSV with proper formatting
-                csv_buffer = io.StringIO()
+                # Convert to CSV - write without text wrapping
+                csv_buffer = io.BytesIO()  # Use BytesIO instead of StringIO
                 
-                # Clean all text fields more aggressively
-                for col in df_output.columns:
-                    if df_output[col].dtype == 'object':
-                        # Replace all types of line breaks and control characters
-                        df_output[col] = df_output[col].apply(lambda x: 
-                            x.replace('\n', ' ').replace('\r', ' ').replace('\r\n', ' ')
-                            .replace('\t', ' ').replace('\v', ' ').replace('\f', ' ')
-                            .replace('\x0b', ' ').replace('\x0c', ' ')
-                            .strip() if isinstance(x, str) else x
-                        )
-                        # Also replace multiple spaces with single space
-                        df_output[col] = df_output[col].apply(lambda x: 
-                            ' '.join(x.split()) if isinstance(x, str) else x
-                        )
+                # Write CSV using Excel-specific formatting to prevent text wrapping
+                # Replace newlines with spaces in the dataframe
+                df_clean = df_output.copy()
+                for col in df_clean.columns:
+                    if df_clean[col].dtype == 'object':
+                        df_clean[col] = df_clean[col].str.replace(r'[\r\n]+', ' ', regex=True)
+                        df_clean[col] = df_clean[col].str.replace(r'\s+', ' ', regex=True)
                 
-                # Write CSV with specific parameters to prevent Excel row expansion
-                df_output.to_csv(
-                    csv_buffer, 
-                    index=False, 
-                    encoding='utf-8-sig',
-                    line_terminator='\n',  # Use only \n, not \r\n
-                    quoting=1,  # Quote all non-numeric fields
-                    escapechar='\\'
-                )
+                # Write to CSV with specific Excel-friendly settings
+                csv_string = df_clean.to_csv(index=False, lineterminator='\n')
+                csv_buffer.write(csv_string.encode('utf-8-sig'))
+                csv_data = csv_buffer.getvalue()
                 
-                csv_data = csv_buffer.getvalue().encode('utf-8-sig')
+                # Show success message - use multiple st calls instead of markdown in one message
+                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions")
                 
-                # Display comprehensive success message
-                st.success(
-                    f"✅ **Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions**\n\n"
-                    f"📊 **Statistics:**\n"
-                    f"- Time elapsed: {str(timedelta(seconds=int(total_time)))}\n"
-                    f"- API calls: {successful_calls} successful, {failed_calls} failed\n"
-                    f"- Total API calls: {total_api_calls}/100,000 (daily limit)\n"
-                    f"- Duplicates removed: {duplicates_removed}"
-                )
+                # Show statistics in a separate container
+                with st.container():
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Time Elapsed", str(timedelta(seconds=int(total_time))))
+                    with col2:
+                        st.metric("API Calls", f"{total_api_calls}/100,000", 
+                                 delta=f"{successful_calls} successful")
+                    with col3:
+                        st.metric("Duplicates Removed", duplicates_removed)
                 
                 st.download_button(
                     label=f"📥 Download {filename}",
@@ -1047,6 +1037,12 @@ def main():
                     file_name=filename,
                     mime="text/csv",
                     type="primary"
+                )
+                
+                # Add info about Excel formatting
+                st.info(
+                    "💡 **Excel Tip:** If rows appear expanded, select all cells (Ctrl+A), "
+                    "right-click on any row number, choose 'Row Height', and set to 15 or 20."
                 )
             else:  # Parquet format
                 filename = f"pubs_{num_institutions}_institutions_{timestamp}.parquet"
@@ -1057,16 +1053,21 @@ def main():
                 
                 file_size_mb = len(parquet_data) / (1024 * 1024)
                 
-                # Display comprehensive success message
-                st.success(
-                    f"✅ **Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions**\n\n"
-                    f"📊 **Statistics:**\n"
-                    f"- Time elapsed: {str(timedelta(seconds=int(total_time)))}\n"
-                    f"- API calls: {successful_calls} successful, {failed_calls} failed\n"
-                    f"- Total API calls: {total_api_calls}/100,000 (daily limit)\n"
-                    f"- File size: {file_size_mb:.1f} MB (Parquet compression)\n"
-                    f"- Duplicates removed: {duplicates_removed}"
-                )
+                # Show success message - use multiple st calls instead of markdown in one message
+                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions")
+                
+                # Show statistics in a separate container
+                with st.container():
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Time Elapsed", str(timedelta(seconds=int(total_time))))
+                    with col2:
+                        st.metric("API Calls", f"{total_api_calls}/100,000", 
+                                 delta=f"{successful_calls} successful")
+                    with col3:
+                        st.metric("File Size", f"{file_size_mb:.1f} MB")
+                    with col4:
+                        st.metric("Duplicates Removed", duplicates_removed)
                 
                 st.download_button(
                     label=f"📥 Download {filename}",
