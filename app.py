@@ -1083,5 +1083,54 @@ def main():
         else:
             st.warning("No publications found for the selected criteria")
 
+        st.session_state.retrieval_data = {
+            "merged_publications": merged_publications,
+            "num_institutions": num_institutions,
+            "duplicates_removed": duplicates_removed,
+            "total_time": total_time,
+            "filename": filename,
+            "csv_data": csv_data,  # or parquet_data
+            "output_format": output_format,
+            "successful_calls": successful_calls,
+            "failed_calls": failed_calls,
+            "total_api_calls": total_api_calls,
+            "file_size_mb": len(parquet_data) / (1024 * 1024) if output_format == "Parquet" else None
+        }
+        st.session_state.retrieval_complete = True
+        st.rerun()
+
+    if st.session_state.get("retrieval_complete", False):
+        data = st.session_state.retrieval_data
+        st.success(f"✅ Retrieved {len(data['merged_publications'])} unique publications from {data['num_institutions']} institutions")
+        
+        with st.container():
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Time Elapsed", str(timedelta(seconds=int(data['total_time']))))
+            with col2:
+                st.metric("API Calls", f"{data['total_api_calls']}/100,000", delta=f"{data['successful_calls']} successful")
+            with col3:
+                st.metric("Duplicates Removed", data['duplicates_removed'])
+            if data["file_size_mb"]:
+                with col4:
+                    st.metric("File Size", f"{data['file_size_mb']:.1f} MB")
+        
+        st.download_button(
+            label=f"📥 Download {data['filename']}",
+            data=data["csv_data"] if data["output_format"] == "CSV" else data["parquet_data"],
+            file_name=data["filename"],
+            mime="text/csv" if data["output_format"] == "CSV" else "application/octet-stream",
+            type="primary"
+        )
+
+        st.info(
+            "💡 **Excel Tip:** If rows appear expanded, select all cells (Ctrl+A), "
+            "right-click on any row number, choose 'Row Height', and set to 15 or 20."
+        )
+
+        # Clean up after showing
+        del st.session_state.retrieval_data
+        st.session_state.retrieval_complete = False
+
 if __name__ == "__main__":
     main()
