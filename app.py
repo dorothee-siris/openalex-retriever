@@ -240,15 +240,21 @@ def format_abstract_optimized(inverted_index):
         return "[Abstract processing error]"
 
 def clean_text_field(text):
-    """Clean text fields by removing line breaks and normalizing whitespace"""
+    """Clean text fields by removing ALL line breaks and control characters"""
     if not text or not isinstance(text, str):
         return text
     
-    # Remove line breaks and carriage returns
+    # Remove all types of line breaks and control characters
+    # Using regex to catch all control characters
+    import re
+    # Remove all control characters (including \n, \r, \t, etc.)
+    text = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', text)
+    # Also specifically handle common problematic characters
     text = text.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    text = text.replace('\u2028', ' ').replace('\u2029', ' ')  # Unicode line/paragraph separators
     # Normalize multiple spaces to single space
     text = ' '.join(text.split())
-    return text
+    return text.strip()
 
 def format_authors_simple(authorships):
     """Format authors information - optimized with list comprehension"""
@@ -944,6 +950,10 @@ def main():
         # Deduplication
         if all_publications:
             status_placeholder.info("Deduplicating publications and merging institution names...")
+            
+            # Store original count before deduplication
+            total_before_dedup = len(all_publications)
+            
             merged_publications = deduplicate_publications_optimized(all_publications)
             
             # Clear memory
@@ -951,10 +961,11 @@ def main():
             gc.collect()
             
             # Update final metrics
+            duplicates_removed = total_before_dedup - len(merged_publications)
             metrics_placeholder.metric(
                 label="Final Results",
                 value=f"{len(merged_publications)} unique publications",
-                delta=f"Processing complete"
+                delta=f"Removed {duplicates_removed} duplicates"
             )
             
             # Create output dataframe
@@ -990,20 +1001,44 @@ def main():
             if output_format == "CSV":
                 filename = f"pubs_{num_institutions}_institutions_{timestamp}.csv"
                 
-                # Use streaming for large files
+                # Convert to CSV with proper formatting
                 csv_buffer = io.StringIO()
-                if len(df_output) > 50000:
-                    write_csv_streaming(df_output, csv_buffer)
-                else:
-                    df_output.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+                
+                # Clean all text fields more aggressively
+                for col in df_output.columns:
+                    if df_output[col].dtype == 'object':
+                        # Replace all types of line breaks and control characters
+                        df_output[col] = df_output[col].apply(lambda x: 
+                            x.replace('\n', ' ').replace('\r', ' ').replace('\r\n', ' ')
+                            .replace('\t', ' ').replace('\v', ' ').replace('\f', ' ')
+                            .replace('\x0b', ' ').replace('\x0c', ' ')
+                            .strip() if isinstance(x, str) else x
+                        )
+                        # Also replace multiple spaces with single space
+                        df_output[col] = df_output[col].apply(lambda x: 
+                            ' '.join(x.split()) if isinstance(x, str) else x
+                        )
+                
+                # Write CSV with specific parameters to prevent Excel row expansion
+                df_output.to_csv(
+                    csv_buffer, 
+                    index=False, 
+                    encoding='utf-8-sig',
+                    line_terminator='\n',  # Use only \n, not \r\n
+                    quoting=1,  # Quote all non-numeric fields
+                    escapechar='\\'
+                )
                 
                 csv_data = csv_buffer.getvalue().encode('utf-8-sig')
                 
-                # Success message with detailed statistics
+                # Display comprehensive success message
                 st.success(
-                    f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions\n\n"
-                    f"**Time elapsed:** {str(timedelta(seconds=int(total_time)))}\n\n"
-                    f"**API calls:** {successful_calls} successful, {failed_calls} failed (Total: {total_api_calls}/100,000 daily limit)"
+                    f"✅ **Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions**\n\n"
+                    f"📊 **Statistics:**\n"
+                    f"- Time elapsed: {str(timedelta(seconds=int(total_time)))}\n"
+                    f"- API calls: {successful_calls} successful, {failed_calls} failed\n"
+                    f"- Total API calls: {total_api_calls}/100,000 (daily limit)\n"
+                    f"- Duplicates removed: {duplicates_removed}"
                 )
                 
                 st.download_button(
@@ -1022,12 +1057,15 @@ def main():
                 
                 file_size_mb = len(parquet_data) / (1024 * 1024)
                 
-                # Success message with detailed statistics
+                # Display comprehensive success message
                 st.success(
-                    f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions\n\n"
-                    f"**Time elapsed:** {str(timedelta(seconds=int(total_time)))}\n\n"
-                    f"**API calls:** {successful_calls} successful, {failed_calls} failed (Total: {total_api_calls}/100,000 daily limit)\n\n"
-                    f"**File size:** {file_size_mb:.1f} MB (Parquet compression)"
+                    f"✅ **Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions**\n\n"
+                    f"📊 **Statistics:**\n"
+                    f"- Time elapsed: {str(timedelta(seconds=int(total_time)))}\n"
+                    f"- API calls: {successful_calls} successful, {failed_calls} failed\n"
+                    f"- Total API calls: {total_api_calls}/100,000 (daily limit)\n"
+                    f"- File size: {file_size_mb:.1f} MB (Parquet compression)\n"
+                    f"- Duplicates removed: {duplicates_removed}"
                 )
                 
                 st.download_button(
