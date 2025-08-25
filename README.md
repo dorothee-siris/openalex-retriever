@@ -1,1 +1,1 @@
-"# OA-retriever" 
+"streamlit run app.py"
