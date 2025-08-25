@@ -227,11 +227,28 @@ def format_abstract_optimized(inverted_index):
         # Use numpy for large abstracts, regular sorting for small ones
         if len(positions) > 1000:
             sort_idx = np.argsort(positions)
-            return " ".join(np.array(words)[sort_idx])
+            abstract_text = " ".join(np.array(words)[sort_idx])
         else:
-            return " ".join(word for _, word in sorted(zip(positions, words)))
+            abstract_text = " ".join(word for _, word in sorted(zip(positions, words)))
+        
+        # Remove line breaks and normalize whitespace
+        abstract_text = abstract_text.replace('\n', ' ').replace('\r', ' ')
+        abstract_text = ' '.join(abstract_text.split())  # Normalize multiple spaces
+        
+        return abstract_text
     except Exception:
         return "[Abstract processing error]"
+
+def clean_text_field(text):
+    """Clean text fields by removing line breaks and normalizing whitespace"""
+    if not text or not isinstance(text, str):
+        return text
+    
+    # Remove line breaks and carriage returns
+    text = text.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    # Normalize multiple spaces to single space
+    text = ' '.join(text.split())
+    return text
 
 def format_authors_simple(authorships):
     """Format authors information - optimized with list comprehension"""
@@ -269,7 +286,7 @@ def format_institutions(authorships):
     return " | ".join(institutions)
 
 def format_raw_affiliation_strings(authorships):
-    """Format raw affiliation strings - optimized with set"""
+    """Format raw affiliation strings - optimized with set and line break removal"""
     if not authorships:
         return ""
     
@@ -277,7 +294,11 @@ def format_raw_affiliation_strings(authorships):
     for authorship in authorships:
         for affiliation in authorship.get("raw_affiliation_strings", []):
             if affiliation and affiliation.strip():
-                affiliations.add(unicodedata.normalize('NFC', affiliation.strip()))
+                # Remove line breaks and normalize whitespace
+                clean_affiliation = affiliation.strip().replace('\n', ' ').replace('\r', ' ')
+                clean_affiliation = ' '.join(clean_affiliation.split())  # Normalize multiple spaces
+                clean_affiliation = unicodedata.normalize('NFC', clean_affiliation)
+                affiliations.add(clean_affiliation)
     
     return " | ".join(sorted(affiliations))
 
@@ -356,6 +377,9 @@ def process_publications_batch(results, institution_id, institution_name, select
             elif field == "doi":
                 doi = pub.get("doi", "")
                 value = DOI_PATTERN.sub('', doi) if doi else ""
+            elif field == "display_name":
+                # Clean title to remove line breaks
+                value = clean_text_field(pub.get("display_name", ""))
             elif field == "abstract_inverted_index":
                 value = format_abstract_optimized(pub.get("abstract_inverted_index", {}))
             elif field == "authorships":
@@ -368,9 +392,14 @@ def process_publications_batch(results, institution_id, institution_name, select
                 topic_name = get_value_from_nested_dict(pub, "primary_topic.display_name")
                 topic_score = get_value_from_nested_dict(pub, "primary_topic.score")
                 value = f"{topic_name} ; {topic_score:.4f}" if topic_name and topic_score is not None else ""
-            elif field.startswith("primary_location.source.issn"):
-                issns = get_value_from_nested_dict(pub, "primary_location.source.issn") or []
-                value = ",".join(issns)
+            elif field.startswith("primary_location.source"):
+                # Clean source-related fields
+                value = get_value_from_nested_dict(pub, field)
+                if field == "primary_location.source.issn":
+                    issns = value or []
+                    value = ",".join(issns)
+                else:
+                    value = clean_text_field(value) if isinstance(value, str) else value
             elif field == "corresponding_author_ids":
                 ids = pub.get("corresponding_author_ids", [])
                 value = " | ".join(OPENALEX_PATTERN.sub('', id) for id in ids)
@@ -391,7 +420,10 @@ def process_publications_batch(results, institution_id, institution_name, select
                 value = ", ".join(pub.get("datasets", []))
             else:
                 value = get_value_from_nested_dict(pub, field)
-                if value is not None and not isinstance(value, str):
+                # Clean any string value to remove line breaks
+                if isinstance(value, str):
+                    value = clean_text_field(value)
+                elif value is not None and not isinstance(value, str):
                     value = str(value)
             
             pub_data[field] = value if value is not None else ""
@@ -860,19 +892,16 @@ def main():
         all_publications = []
         
         # Process each institution with progress updates
-        update_interval = max(1, len(st.session_state.selected_institutions) // 20)
-        
         for i, inst in enumerate(st.session_state.selected_institutions):
             st.session_state.progress_data['current_institution'] = i + 1
             
-            # Update progress at intervals
-            if i % update_interval == 0 or i == len(st.session_state.selected_institutions) - 1:
-                progress = (i + 1) / len(st.session_state.selected_institutions)
-                progress_bar.progress(progress)
-                
-                # Update timer
-                elapsed = time.time() - start_time
-                timer_placeholder.info(f"⏱️ Time elapsed: {timedelta(seconds=int(elapsed))}")
+            # Update progress and timer
+            progress = (i + 1) / len(st.session_state.selected_institutions)
+            progress_bar.progress(progress)
+            
+            # Update timer - show elapsed time
+            elapsed = time.time() - start_time
+            timer_placeholder.info(f"⏱️ Time elapsed: {str(timedelta(seconds=int(elapsed)))}")
             
             status_placeholder.info(f"Fetching: {inst['display_name']}")
             
@@ -937,7 +966,7 @@ def main():
             
             # Calculate total time
             total_time = time.time() - start_time
-            timer_placeholder.success(f"✅ Total processing time: {timedelta(seconds=int(total_time))}")
+            timer_placeholder.success(f"✅ Total processing time: {str(timedelta(seconds=int(total_time)))}")
             
             if output_format == "CSV":
                 filename = f"pubs_{num_institutions}_institutions_{timestamp}.csv"
@@ -951,7 +980,7 @@ def main():
                 
                 csv_data = csv_buffer.getvalue().encode('utf-8-sig')
                 
-                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions in {timedelta(seconds=int(total_time))}")
+                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions in {str(timedelta(seconds=int(total_time)))}")
                 
                 st.download_button(
                     label=f"📥 Download {filename}",
@@ -968,7 +997,7 @@ def main():
                 parquet_data = parquet_buffer.getvalue()
                 
                 file_size_mb = len(parquet_data) / (1024 * 1024)
-                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions in {timedelta(seconds=int(total_time))} (Parquet size: {file_size_mb:.1f} MB)")
+                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions in {str(timedelta(seconds=int(total_time)))} (Parquet size: {file_size_mb:.1f} MB)")
                 
                 st.download_button(
                     label=f"📥 Download {filename}",
