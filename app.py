@@ -444,8 +444,15 @@ def fetch_single_doc_type(session, url, base_filter_str, doc_type, institution_i
     publications = []
     response = rate_limited_get(session, url, params=params)
     
-    if not response or response.status_code != 200:
+    if not response:
+        st.session_state.progress_data['failed_requests'] += 1
         return publications
+    
+    if response.status_code != 200:
+        st.session_state.progress_data['failed_requests'] += 1
+        return publications
+    
+    st.session_state.progress_data['successful_requests'] += 1
     
     try:
         data = response.json()
@@ -464,16 +471,20 @@ def fetch_single_doc_type(session, url, base_filter_str, doc_type, institution_i
             response = rate_limited_get(session, url, params=params)
             
             if response and response.status_code == 200:
+                st.session_state.progress_data['successful_requests'] += 1
                 data = response.json()
                 publications.extend(process_publications_batch(
                     data.get("results", []), institution_id, institution_name, selected_metadata
                 ))
+            else:
+                st.session_state.progress_data['failed_requests'] += 1
                 
-                # Memory management for large datasets
-                if len(publications) % 5000 == 0:
-                    gc.collect()
+            # Memory management for large datasets
+            if len(publications) % 5000 == 0:
+                gc.collect()
     except Exception as e:
         st.error(f"Error processing publications: {e}")
+        st.session_state.progress_data['failed_requests'] += 1
     
     return publications
 
@@ -558,20 +569,17 @@ def deduplicate_publications_optimized(all_publications):
     return result
 
 def write_csv_streaming(df, buffer, chunk_size=10000):
-    """Write CSV in chunks for better memory management"""
-    # Write header
-    df.iloc[:0].to_csv(buffer, index=False, encoding='utf-8-sig')
+    """Write CSV in chunks for better memory management with proper escaping"""
+    # Clean all string columns to remove line breaks
+    for col in df.columns:
+        if df[col].dtype == 'object':  # String columns
+            df[col] = df[col].apply(lambda x: clean_text_field(x) if isinstance(x, str) else x)
     
-    # Write data in chunks
-    for start in range(0, len(df), chunk_size):
-        end = min(start + chunk_size, len(df))
-        df.iloc[start:end].to_csv(
-            buffer, mode='a', header=False, index=False, encoding='utf-8-sig'
-        )
-        
-        # Free memory periodically
-        if start % (chunk_size * 5) == 0:
-            gc.collect()
+    # Write with proper quoting to handle special characters
+    df.to_csv(buffer, index=False, encoding='utf-8-sig', 
+              quoting=1,  # Quote all non-numeric fields
+              lineterminator='\n',  # Ensure consistent line endings
+              escapechar='\\')  # Escape special characters
 
 def update_doc_types_callback(select_all):
     """Callback for document type selection"""
@@ -877,6 +885,7 @@ def main():
             'current_institution': 0,
             'total_institutions': len(st.session_state.selected_institutions),
             'successful_requests': 0,
+            'failed_requests': 0,
             'publications_fetched': 0
         }
         
@@ -951,6 +960,11 @@ def main():
             # Create output dataframe
             df_output = pd.DataFrame(merged_publications)
             
+            # Clean all text fields in the dataframe to remove line breaks
+            for col in df_output.columns:
+                if df_output[col].dtype == 'object':  # String columns
+                    df_output[col] = df_output[col].apply(lambda x: clean_text_field(x) if isinstance(x, str) else x)
+            
             # Reorder columns
             columns_order = ["id"] + [col for col in selected_metadata if col != "id"] + ["institutions_extracted"]
             df_output = df_output[[col for col in columns_order if col in df_output.columns]]
@@ -968,6 +982,11 @@ def main():
             total_time = time.time() - start_time
             timer_placeholder.success(f"✅ Total processing time: {str(timedelta(seconds=int(total_time)))}")
             
+            # Get API call statistics
+            total_api_calls = st.session_state.progress_data.get('successful_requests', 0) + st.session_state.progress_data.get('failed_requests', 0)
+            successful_calls = st.session_state.progress_data.get('successful_requests', 0)
+            failed_calls = st.session_state.progress_data.get('failed_requests', 0)
+            
             if output_format == "CSV":
                 filename = f"pubs_{num_institutions}_institutions_{timestamp}.csv"
                 
@@ -980,7 +999,12 @@ def main():
                 
                 csv_data = csv_buffer.getvalue().encode('utf-8-sig')
                 
-                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions in {str(timedelta(seconds=int(total_time)))}")
+                # Success message with detailed statistics
+                st.success(
+                    f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions\n\n"
+                    f"**Time elapsed:** {str(timedelta(seconds=int(total_time)))}\n\n"
+                    f"**API calls:** {successful_calls} successful, {failed_calls} failed (Total: {total_api_calls}/100,000 daily limit)"
+                )
                 
                 st.download_button(
                     label=f"📥 Download {filename}",
@@ -997,7 +1021,14 @@ def main():
                 parquet_data = parquet_buffer.getvalue()
                 
                 file_size_mb = len(parquet_data) / (1024 * 1024)
-                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions in {str(timedelta(seconds=int(total_time)))} (Parquet size: {file_size_mb:.1f} MB)")
+                
+                # Success message with detailed statistics
+                st.success(
+                    f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions\n\n"
+                    f"**Time elapsed:** {str(timedelta(seconds=int(total_time)))}\n\n"
+                    f"**API calls:** {successful_calls} successful, {failed_calls} failed (Total: {total_api_calls}/100,000 daily limit)\n\n"
+                    f"**File size:** {file_size_mb:.1f} MB (Parquet compression)"
+                )
                 
                 st.download_button(
                     label=f"📥 Download {filename}",
