@@ -1,17 +1,26 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
 import time
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
-import threading
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
 
 # Constants
 MAILTO = "theodore.hervieux@sirisacademic.com"
 PUBLICATIONS_DELAY = 0.1  # 100ms between requests
 RETRY_AFTER_429 = 2
 CURRENT_YEAR = datetime.now().year
+BATCH_SIZE = 1000  # For processing large datasets
+MAX_WORKERS = 3  # For parallel API requests
+
+# Pre-compiled regex patterns for better performance
+OPENALEX_PATTERN = re.compile(r'https://openalex.org/')
+DOI_PATTERN = re.compile(r'https://doi.org/')
 
 # Document types from OpenAlex
 DOCUMENT_TYPES = [
@@ -87,6 +96,23 @@ if 'last_request_time' not in st.session_state:
 if 'progress_data' not in st.session_state:
     st.session_state.progress_data = {}
 
+@st.cache_resource
+def get_session():
+    """Create and cache a requests session with connection pooling"""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': f'SIRIS Academic Research Tool/1.0 (mailto:{MAILTO})'
+    })
+    # Add connection pooling for better performance
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=10,
+        pool_maxsize=10,
+        max_retries=3
+    )
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
 @st.cache_data
 def load_institutions():
     """Load institutions from parquet file"""
@@ -97,41 +123,42 @@ def load_institutions():
         st.error(f"Error loading institutions file: {e}")
         return None
 
-def search_institutions(df, query):
-    """Search institutions by name, alternatives, acronyms, and city"""
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def search_institutions_cached(df, query):
+    """Cached search for institutions"""
     if not query or len(query) < 2:
         return pd.DataFrame()
     
     query_lower = query.lower()
     
-    # Search in display_name, alternatives, acronyms, AND city
+    # Vectorized search for better performance
     mask = (
-        df['display_name'].str.lower().str.contains(query_lower, na=False) |
-        df['display_name_alternatives'].str.lower().str.contains(query_lower, na=False) |
-        df['display_name_acronyms'].str.lower().str.contains(query_lower, na=False) |
-        df['city'].str.lower().str.contains(query_lower, na=False)
+        df['display_name'].str.lower().str.contains(query_lower, na=False, regex=False) |
+        df['display_name_alternatives'].str.lower().str.contains(query_lower, na=False, regex=False) |
+        df['display_name_acronyms'].str.lower().str.contains(query_lower, na=False, regex=False) |
+        df['city'].str.lower().str.contains(query_lower, na=False, regex=False)
     )
     
-    results = df[mask]  # No limit - show all matching results
+    results = df[mask]
     
-    # Prepare display dataframe with Select column
+    # Prepare display dataframe
     display_df = pd.DataFrame({
-        'Select': False,  # Checkbox column
-        'Name': results['display_name'],
-        'Acronym': results['display_name_acronyms'],
-        'Type': results['type'],
-        'Country': results['country_code'],
-        'City': results['city'],
+        'Select': False,
+        'Name': results['display_name'].values,
+        'Acronym': results['display_name_acronyms'].values,
+        'Type': results['type'].values,
+        'Country': results['country_code'].values,
+        'City': results['city'].values,
         'ROR': results['ror_id'].apply(lambda x: f"https://ror.org/{x}" if x else ""),
-        'Total Works': results['total_works_count'],
-        'Avg. Works/Year': results['avg_works_per_year_2021_2023'],
-        'openalex_id': results['openalex_id']  # Keep for selection
+        'Total Works': results['total_works_count'].values,
+        'Avg. Works/Year': results['avg_works_per_year_2021_2023'].values,
+        'openalex_id': results['openalex_id'].values
     })
     
     return display_df
 
 def rate_limited_get(session, url, params=None, max_retries=3):
-    """Rate-limited API request"""
+    """Rate-limited API request with exponential backoff"""
     retry_count = 0
     backoff_time = RETRY_AFTER_429
     
@@ -143,142 +170,139 @@ def rate_limited_get(session, url, params=None, max_retries=3):
             time.sleep(PUBLICATIONS_DELAY - elapsed)
         st.session_state.last_request_time = time.time()
         
-        response = session.get(url, params=params)
-        
-        if response.status_code == 200:
-            return response
-        elif response.status_code == 429:
-            retry_count += 1
-            if retry_count > max_retries:
+        try:
+            response = session.get(url, params=params, timeout=30)
+            
+            if response.status_code == 200:
                 return response
-            wait_time = backoff_time * (0.5 + 0.5)
-            time.sleep(wait_time)
-            backoff_time *= 2
-        else:
-            return response
+            elif response.status_code == 429:
+                retry_count += 1
+                if retry_count > max_retries:
+                    return response
+                wait_time = backoff_time * (0.5 + 0.5 * np.random.random())
+                time.sleep(wait_time)
+                backoff_time *= 2
+            else:
+                return response
+        except requests.exceptions.RequestException:
+            retry_count += 1
+            if retry_count <= max_retries:
+                time.sleep(backoff_time)
     
-    return response
+    return None
 
 def get_value_from_nested_dict(data, key_path):
-    """Extract value from nested dictionary"""
+    """Extract value from nested dictionary - optimized version"""
     if not data or not key_path:
         return None
     
     keys = key_path.split(".")
     value = data
     
-    try:
-        for key in keys:
-            if value is None:
-                return None
+    for key in keys:
+        if value is None:
+            return None
+        try:
             value = value.get(key)
-        return value
-    except (AttributeError, KeyError):
-        return None
+        except AttributeError:
+            return None
+    return value
 
-def format_abstract(inverted_index):
-    """Reconstruct abstract from inverted index"""
+def format_abstract_optimized(inverted_index):
+    """Optimized abstract reconstruction using numpy for large abstracts"""
     if not inverted_index:
         return ""
     
-    word_positions = []
     try:
-        for word, positions in inverted_index.items():
-            for pos in positions:
-                word_positions.append((pos, word))
+        positions = []
+        words = []
         
-        sorted_words = [word for _, word in sorted(word_positions)]
-        return " ".join(sorted_words)
+        for word, pos_list in inverted_index.items():
+            positions.extend(pos_list)
+            words.extend([word] * len(pos_list))
+        
+        if not positions:
+            return ""
+        
+        # Use numpy for large abstracts, regular sorting for small ones
+        if len(positions) > 1000:
+            sort_idx = np.argsort(positions)
+            return " ".join(np.array(words)[sort_idx])
+        else:
+            return " ".join(word for _, word in sorted(zip(positions, words)))
     except Exception:
         return "[Abstract processing error]"
 
 def format_authors_simple(authorships):
-    """Format authors information"""
+    """Format authors information - optimized with list comprehension"""
     if not authorships:
         return ""
     
-    authors = []
-    for authorship in authorships:
-        author_data = authorship.get("author", {})
-        author_name = author_data.get("display_name", "Unknown")
-        author_name = unicodedata.normalize('NFC', author_name.strip())
-        
-        if authorship.get("is_corresponding", False):
-            author_name += " (corresponding)"
-        
-        authors.append(author_name)
+    authors = [
+        f"{authorship.get('author', {}).get('display_name', 'Unknown').strip()} (corresponding)"
+        if authorship.get("is_corresponding", False)
+        else authorship.get('author', {}).get('display_name', 'Unknown').strip()
+        for authorship in authorships
+    ]
     
     return " | ".join(authors)
 
 def format_institutions(authorships):
-    """Format institutions information with semicolon separator"""
+    """Format institutions with deduplication - optimized version"""
     if not authorships:
         return ""
     
-    unique_institutions = {}
-    institution_order = []
+    seen = set()
+    institutions = []
     
     for authorship in authorships:
-        institutions = authorship.get("institutions", [])
-        for inst in institutions:
+        for inst in authorship.get("institutions", []):
             inst_id = inst.get("id", "")
-            if inst_id and inst_id not in unique_institutions:
+            if inst_id and inst_id not in seen:
+                seen.add(inst_id)
                 inst_name = inst.get("display_name", "Unknown")
                 inst_type = inst.get("type", "Unknown")
                 inst_country = inst.get("country_code", "Unknown")
-                inst_id_clean = inst_id.replace("https://openalex.org/", "")
-                
-                formatted_inst = f"{inst_name} ; {inst_type} ; {inst_country} ({inst_id_clean})"
-                unique_institutions[inst_id] = formatted_inst
-                institution_order.append(inst_id)
+                inst_id_clean = OPENALEX_PATTERN.sub('', inst_id)
+                institutions.append(f"{inst_name} ; {inst_type} ; {inst_country} ({inst_id_clean})")
     
-    return " | ".join([unique_institutions[inst_id] for inst_id in institution_order])
+    return " | ".join(institutions)
 
 def format_raw_affiliation_strings(authorships):
-    """Format raw affiliation strings with better separator"""
+    """Format raw affiliation strings - optimized with set"""
     if not authorships:
         return ""
     
-    all_affiliations = []
+    affiliations = set()
     for authorship in authorships:
-        raw_affiliations = authorship.get("raw_affiliation_strings", [])
-        for affiliation in raw_affiliations:
+        for affiliation in authorship.get("raw_affiliation_strings", []):
             if affiliation and affiliation.strip():
-                clean_affiliation = unicodedata.normalize('NFC', affiliation.strip())
-                if clean_affiliation not in all_affiliations:
-                    all_affiliations.append(clean_affiliation)
+                affiliations.add(unicodedata.normalize('NFC', affiliation.strip()))
     
-    return " | ".join(all_affiliations)
+    return " | ".join(sorted(affiliations))
 
 def format_counts_by_year(counts):
-    """Format counts by year"""
+    """Format counts by year - optimized"""
     if not counts:
         return ""
     
-    sorted_counts = sorted(counts, key=lambda x: x.get("year", 0), reverse=True)
-    formatted_counts = []
-    for count in sorted_counts:
-        year = count.get("year", "Unknown")
-        cited_by_count = count.get("cited_by_count", 0)
-        formatted_counts.append(f"{cited_by_count} ({year})")
-    
-    return " | ".join(formatted_counts)
+    return " | ".join(
+        f"{c.get('cited_by_count', 0)} ({c.get('year', 'Unknown')})"
+        for c in sorted(counts, key=lambda x: x.get("year", 0), reverse=True)
+    )
 
 def format_topic_and_score(topics):
-    """Format topics with scores using semicolon separator"""
+    """Format topics with scores"""
     if not topics:
         return ""
     
-    formatted_topics = []
-    for topic in topics:
-        display_name = topic.get("display_name", "Unknown")
-        score = topic.get("score", 0)
-        formatted_topics.append(f"{display_name} ; {score:.4f}")
-    
-    return " | ".join(formatted_topics)
+    return " | ".join(
+        f"{t.get('display_name', 'Unknown')} ; {t.get('score', 0):.4f}"
+        for t in topics
+    )
 
 def format_concepts(concepts):
-    """Format concepts by level with semicolon separator"""
+    """Format concepts - optimized version"""
     if not concepts:
         return ""
     
@@ -287,49 +311,40 @@ def format_concepts(concepts):
         level = concept.get("level", 0)
         if level not in concepts_by_level:
             concepts_by_level[level] = []
-        
-        display_name = concept.get("display_name", "Unknown")
-        score = concept.get("score", 0)
-        concepts_by_level[level].append(f"{display_name} ; {score:.4f} (level {level})")
+        concepts_by_level[level].append(
+            f"{concept.get('display_name', 'Unknown')} ; {concept.get('score', 0):.4f} (level {level})"
+        )
     
-    formatted_concepts = []
-    for level in sorted(concepts_by_level.keys()):
-        formatted_concepts.extend(concepts_by_level[level])
-    
-    return " | ".join(formatted_concepts)
+    return " | ".join(
+        item for level in sorted(concepts_by_level.keys())
+        for item in concepts_by_level[level]
+    )
 
 def format_sdgs(sdgs):
-    """Format SDGs with semicolon separator"""
+    """Format SDGs"""
     if not sdgs:
         return ""
     
-    formatted_sdgs = []
-    for sdg in sdgs:
-        display_name = sdg.get("display_name", "Unknown")
-        score = sdg.get("score", 0)
-        formatted_sdgs.append(f"{display_name} ; {score:.2f}")
-    
-    return " | ".join(formatted_sdgs)
+    return " | ".join(
+        f"{sdg.get('display_name', 'Unknown')} ; {sdg.get('score', 0):.2f}"
+        for sdg in sdgs
+    )
 
 def format_grants(grants):
     """Format grants"""
     if not grants:
         return ""
     
-    formatted_grants = []
+    formatted = []
     for grant in grants:
         funder = grant.get("funder_display_name", "Unknown")
         award_id = grant.get("award_id", "")
-        
-        if award_id:
-            formatted_grants.append(f"{funder} ({award_id})")
-        else:
-            formatted_grants.append(funder)
+        formatted.append(f"{funder} ({award_id})" if award_id else funder)
     
-    return ", ".join(formatted_grants)
+    return ", ".join(formatted)
 
-def process_publications(results, institution_id, institution_name, selected_metadata):
-    """Process publication results"""
+def process_publications_batch(results, institution_id, institution_name, selected_metadata):
+    """Process publications in batches for better memory management"""
     publications = []
     
     for pub in results:
@@ -337,12 +352,12 @@ def process_publications(results, institution_id, institution_name, selected_met
         
         for field in selected_metadata:
             if field == "id":
-                value = pub.get("id", "").replace("https://openalex.org/", "")
+                value = OPENALEX_PATTERN.sub('', pub.get("id", ""))
             elif field == "doi":
                 doi = pub.get("doi", "")
-                value = doi.replace("https://doi.org/", "") if doi else ""
+                value = DOI_PATTERN.sub('', doi) if doi else ""
             elif field == "abstract_inverted_index":
-                value = format_abstract(pub.get("abstract_inverted_index", {}))
+                value = format_abstract_optimized(pub.get("abstract_inverted_index", {}))
             elif field == "authorships":
                 value = format_authors_simple(pub.get("authorships", []))
             elif field == "institutions":
@@ -350,22 +365,18 @@ def process_publications(results, institution_id, institution_name, selected_met
             elif field == "raw_affiliation_strings":
                 value = format_raw_affiliation_strings(pub.get("authorships", []))
             elif field == "primary_topic_and_score":
-                # Combine primary topic name and score
                 topic_name = get_value_from_nested_dict(pub, "primary_topic.display_name")
                 topic_score = get_value_from_nested_dict(pub, "primary_topic.score")
-                if topic_name and topic_score is not None:
-                    value = f"{topic_name} ; {topic_score:.4f}"
-                else:
-                    value = ""
+                value = f"{topic_name} ; {topic_score:.4f}" if topic_name and topic_score is not None else ""
             elif field.startswith("primary_location.source.issn"):
                 issns = get_value_from_nested_dict(pub, "primary_location.source.issn") or []
                 value = ",".join(issns)
             elif field == "corresponding_author_ids":
                 ids = pub.get("corresponding_author_ids", [])
-                value = " | ".join([id.replace("https://openalex.org/", "") for id in ids])
+                value = " | ".join(OPENALEX_PATTERN.sub('', id) for id in ids)
             elif field == "corresponding_institution_ids":
                 ids = pub.get("corresponding_institution_ids", [])
-                value = " | ".join([id.replace("https://openalex.org/", "") for id in ids])
+                value = " | ".join(OPENALEX_PATTERN.sub('', id) for id in ids)
             elif field == "counts_by_year":
                 value = format_counts_by_year(pub.get("counts_by_year", []))
             elif field == "topics":
@@ -377,8 +388,7 @@ def process_publications(results, institution_id, institution_name, selected_met
             elif field == "grants":
                 value = format_grants(pub.get("grants", []))
             elif field == "datasets":
-                datasets = pub.get("datasets", [])
-                value = ", ".join(datasets)
+                value = ", ".join(pub.get("datasets", []))
             else:
                 value = get_value_from_nested_dict(pub, field)
                 if value is not None and not isinstance(value, str):
@@ -390,51 +400,58 @@ def process_publications(results, institution_id, institution_name, selected_met
     
     return publications
 
-def fetch_with_pagination(session, url, params, institution_id, institution_name, selected_metadata, progress_placeholder):
-    """Fetch paginated results"""
+def fetch_single_doc_type(session, url, base_filter_str, doc_type, institution_id, institution_name, selected_metadata):
+    """Fetch publications for a single document type"""
+    filter_str = f"{base_filter_str},type:{doc_type}" if doc_type else base_filter_str
+    params = {
+        "filter": filter_str,
+        "per_page": 50,
+        "mailto": MAILTO
+    }
+    
     publications = []
+    response = rate_limited_get(session, url, params=params)
+    
+    if not response or response.status_code != 200:
+        return publications
     
     try:
-        response = rate_limited_get(session, url, params=params)
-        
-        if response.status_code != 200:
-            return []
-        
         data = response.json()
         total_results = data.get("meta", {}).get("count", 0)
         per_page = data.get("meta", {}).get("per_page", 50)
-        total_pages = (total_results // per_page) + (1 if total_results % per_page > 0 else 0)
-        
-        # Update progress
-        st.session_state.progress_data['successful_requests'] += 1
+        total_pages = (total_results + per_page - 1) // per_page
         
         # Process first page
-        publications.extend(process_publications(data.get("results", []), institution_id, institution_name, selected_metadata))
+        publications.extend(process_publications_batch(
+            data.get("results", []), institution_id, institution_name, selected_metadata
+        ))
         
         # Get remaining pages
-        for page in range(2, total_pages + 1):
+        for page in range(2, min(total_pages + 1, 200)):  # Limit to 200 pages per doc type
             params["page"] = page
             response = rate_limited_get(session, url, params=params)
             
-            if response.status_code == 200:
+            if response and response.status_code == 200:
                 data = response.json()
-                publications.extend(process_publications(data.get("results", []), institution_id, institution_name, selected_metadata))
-                st.session_state.progress_data['successful_requests'] += 1
-            else:
-                break
+                publications.extend(process_publications_batch(
+                    data.get("results", []), institution_id, institution_name, selected_metadata
+                ))
                 
+                # Memory management for large datasets
+                if len(publications) % 5000 == 0:
+                    gc.collect()
     except Exception as e:
-        st.error(f"Error fetching publications: {e}")
+        st.error(f"Error processing publications: {e}")
     
     return publications
 
-def fetch_publications(session, institution_id, institution_name, start_year, end_year, doc_types, selected_metadata, language_filter, progress_placeholder):
-    """Fetch publications for an institution"""
+def fetch_publications_parallel(session, institution_id, institution_name, start_year, end_year, 
+                              doc_types, selected_metadata, language_filter):
+    """Fetch publications using parallel requests for different document types"""
     if institution_id.startswith("https://openalex.org/"):
         institution_id = institution_id.split("/")[-1]
     
     institution_id = institution_id.lower()
-    
     url = "https://api.openalex.org/works"
     
     base_filter_parts = [
@@ -449,25 +466,31 @@ def fetch_publications(session, institution_id, institution_name, start_year, en
     
     all_publications = []
     
-    if not doc_types:  # All Works mode
-        params = {
-            "filter": base_filter_str,
-            "per_page": 50,
-            "mailto": MAILTO
-        }
-        all_publications.extend(fetch_with_pagination(session, url, params, institution_id, institution_name, selected_metadata, progress_placeholder))
+    if not doc_types:  # All Works mode - single request
+        publications = fetch_single_doc_type(
+            session, url, base_filter_str, None, institution_id, institution_name, selected_metadata
+        )
+        all_publications.extend(publications)
     else:
-        for doc_type in doc_types:
-            filter_str = f"{base_filter_str},type:{doc_type}"
-            params = {
-                "filter": filter_str,
-                "per_page": 50,
-                "mailto": MAILTO
-            }
-            type_publications = fetch_with_pagination(session, url, params, institution_id, institution_name, selected_metadata, progress_placeholder)
-            all_publications.extend(type_publications)
+        # Use ThreadPoolExecutor for parallel requests
+        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(doc_types))) as executor:
+            futures = []
+            for doc_type in doc_types:
+                future = executor.submit(
+                    fetch_single_doc_type, session, url, base_filter_str, 
+                    doc_type, institution_id, institution_name, selected_metadata
+                )
+                futures.append(future)
+            
+            # Collect results as they complete
+            for future in as_completed(futures):
+                try:
+                    publications = future.result()
+                    all_publications.extend(publications)
+                except Exception as e:
+                    st.error(f"Error in parallel fetch: {e}")
     
-    # Remove duplicates
+    # Remove duplicates within institution
     unique_publications = {}
     for pub in all_publications:
         pub_id = pub.get("id", "")
@@ -475,6 +498,60 @@ def fetch_publications(session, institution_id, institution_name, start_year, en
             unique_publications[pub_id] = pub
     
     return list(unique_publications.values())
+
+def deduplicate_publications_optimized(all_publications):
+    """Optimized deduplication using sets and single pass"""
+    seen = {}
+    
+    for pub in all_publications:
+        pub_id = pub.get("id", "")
+        if pub_id:
+            if pub_id not in seen:
+                seen[pub_id] = {
+                    'data': pub,
+                    'institutions': {pub.get("institutions_extracted", "")}
+                }
+            else:
+                inst = pub.get("institutions_extracted", "")
+                if inst:
+                    seen[pub_id]['institutions'].add(inst)
+    
+    # Build final list with merged institutions
+    result = []
+    for item in seen.values():
+        pub_data = item['data'].copy()
+        pub_data['institutions_extracted'] = ' | '.join(sorted(item['institutions']))
+        result.append(pub_data)
+    
+    return result
+
+def write_csv_streaming(df, buffer, chunk_size=10000):
+    """Write CSV in chunks for better memory management"""
+    # Write header
+    df.iloc[:0].to_csv(buffer, index=False, encoding='utf-8-sig')
+    
+    # Write data in chunks
+    for start in range(0, len(df), chunk_size):
+        end = min(start + chunk_size, len(df))
+        df.iloc[start:end].to_csv(
+            buffer, mode='a', header=False, index=False, encoding='utf-8-sig'
+        )
+        
+        # Free memory periodically
+        if start % (chunk_size * 5) == 0:
+            gc.collect()
+
+def update_doc_types_callback(select_all):
+    """Callback for document type selection"""
+    st.session_state.doc_types_state = {
+        doc_type: select_all for doc_type in DOCUMENT_TYPES
+    }
+
+def update_metadata_callback(select_all):
+    """Callback for metadata selection"""
+    st.session_state.metadata_state = {
+        field: (select_all or field == "id") for field in METADATA_FIELDS.keys()
+    }
 
 def main():
     st.set_page_config(
@@ -502,12 +579,12 @@ def main():
     
     # Full width layout for results
     if search_query:
-        results_df = search_institutions(institutions_df, search_query)
+        results_df = search_institutions_cached(institutions_df, search_query)
         
         if not results_df.empty:
             st.info(f"📊 Found {len(results_df)} matching institutions. Select up to {10 - len(st.session_state.selected_institutions)} more institutions.")
             
-            # Use st.data_editor for interactive selection with checkboxes
+            # Use st.data_editor for interactive selection
             edited_df = st.data_editor(
                 results_df.drop(columns=['openalex_id']),
                 hide_index=True,
@@ -546,7 +623,6 @@ def main():
             col1, col2 = st.columns([1, 5])
             with col1:
                 if st.button("➕ Add Selected", type="primary"):
-                    # Get selected rows
                     selected_rows = edited_df[edited_df['Select'] == True]
                     
                     if not selected_rows.empty:
@@ -557,7 +633,6 @@ def main():
                                 'display_name': row['Name']
                             }
                             
-                            # Check if not already added and limit not reached
                             if len(st.session_state.selected_institutions) < 10:
                                 if not any(i['openalex_id'] == inst_data['openalex_id'] 
                                          for i in st.session_state.selected_institutions):
@@ -574,10 +649,9 @@ def main():
         else:
             st.info("No institutions found matching your search")
     
-    # Display selected institutions in a more compact sidebar-like section
+    # Display selected institutions
     st.divider()
     
-    # Selected institutions display
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         st.subheader(f"📋 Selected Institutions ({len(st.session_state.selected_institutions)}/10)")
@@ -588,25 +662,23 @@ def main():
     
     if st.session_state.selected_institutions:
         # Calculate total estimated publications per year
-        total_avg_works = 0
-        for inst in st.session_state.selected_institutions:
-            # Find the institution in the dataframe to get avg_works_per_year
-            inst_data = institutions_df[institutions_df['openalex_id'] == inst['openalex_id']]
-            if not inst_data.empty:
-                avg_works = inst_data.iloc[0]['avg_works_per_year_2021_2023']
-                if pd.notna(avg_works):
-                    total_avg_works += avg_works
+        total_avg_works = sum(
+            institutions_df[institutions_df['openalex_id'] == inst['openalex_id']]['avg_works_per_year_2021_2023'].iloc[0]
+            for inst in st.session_state.selected_institutions
+            if not institutions_df[institutions_df['openalex_id'] == inst['openalex_id']].empty
+        )
         
-        # Display estimation warning
-        if len(st.session_state.selected_institutions) == 1:
-            st.markdown(f"<p style='color: red;'>This institution produces an estimation of <b>{total_avg_works:.0f}</b> publications per year (all document types).</p>", unsafe_allow_html=True)
-        else:
-            st.markdown(f"<p style='color: red;'>These institutions produce an estimation of <b>{total_avg_works:.0f}</b> publications per year (all document types).</p>", unsafe_allow_html=True)
+        # Display estimation
+        inst_text = "institution produces" if len(st.session_state.selected_institutions) == 1 else "institutions produce"
+        st.markdown(
+            f"<p style='color: red;'>{'This' if len(st.session_state.selected_institutions) == 1 else 'These'} "
+            f"{inst_text} an estimation of <b>{total_avg_works:.0f}</b> publications per year (all document types).</p>",
+            unsafe_allow_html=True
+        )
         
-        # Store in session state for later use
         st.session_state.total_avg_works_per_year = total_avg_works
         
-        # Display selected institutions in a clean format
+        # Display selected institutions
         for i, inst in enumerate(st.session_state.selected_institutions):
             col1, col2 = st.columns([11, 1])
             with col1:
@@ -628,7 +700,6 @@ def main():
     # Phase 2: Configure Retrieval Parameters
     st.header("2️⃣ Configure Retrieval Parameters")
     
-    # Timeframe and output format
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         start_year = st.number_input("Start Year", min_value=1970, max_value=CURRENT_YEAR, value=CURRENT_YEAR-5)
@@ -637,82 +708,68 @@ def main():
     with col3:
         language_filter = st.radio("Language Filter", ["All Languages", "English Only"])
     with col4:
-        output_format = st.radio("Output Format", ["CSV", "Parquet"], help="Parquet format provides better compression for large files")
+        output_format = st.radio("Output Format", ["CSV", "Parquet"], 
+                                help="Parquet format provides better compression for large files")
     
     # Document Types
     st.subheader("Document Types")
     
-    # Initialize session state for document types if not exists
     if 'doc_types_state' not in st.session_state:
         st.session_state.doc_types_state = {doc_type: True for doc_type in DOCUMENT_TYPES}
         st.session_state.all_works = True
     
-    # Add Select All / Unselect All buttons
     col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
         all_works = st.checkbox("All Works (no document type filtering - faster)", value=st.session_state.all_works)
     with col2:
-        if st.button("Select All", key="select_all_docs", disabled=all_works):
-            st.session_state.doc_types_state = {doc_type: True for doc_type in DOCUMENT_TYPES}
-            st.rerun()
+        st.button("Select All", key="select_all_docs", disabled=all_works,
+                 on_click=update_doc_types_callback, args=(True,))
     with col3:
-        if st.button("Unselect All", key="unselect_all_docs", disabled=all_works):
-            st.session_state.doc_types_state = {doc_type: False for doc_type in DOCUMENT_TYPES}
-            st.rerun()
+        st.button("Unselect All", key="unselect_all_docs", disabled=all_works,
+                 on_click=update_doc_types_callback, args=(False,))
     
-    # Update session state when All Works changes
     if all_works != st.session_state.all_works:
         st.session_state.all_works = all_works
         if all_works:
-            # Check all document types when All Works is selected
             st.session_state.doc_types_state = {doc_type: True for doc_type in DOCUMENT_TYPES}
     
-    # Always show document type checkboxes
     doc_cols = st.columns(5)
     selected_doc_types = []
     
     for i, doc_type in enumerate(DOCUMENT_TYPES):
         with doc_cols[i % 5]:
-            # If All Works is checked, show types as checked but disabled
             if all_works:
-                checked = st.checkbox(doc_type, value=True, disabled=True, key=f"doc_{doc_type}")
+                st.checkbox(doc_type, value=True, disabled=True, key=f"doc_{doc_type}")
             else:
-                checked = st.checkbox(doc_type, value=st.session_state.doc_types_state.get(doc_type, False), key=f"doc_{doc_type}")
+                checked = st.checkbox(doc_type, value=st.session_state.doc_types_state.get(doc_type, False), 
+                                    key=f"doc_{doc_type}")
                 st.session_state.doc_types_state[doc_type] = checked
                 if checked:
                     selected_doc_types.append(doc_type)
     
-    # If All Works is selected, use empty list (no filtering)
     if all_works:
         selected_doc_types = []
     
     # Metadata Fields
     st.subheader("Metadata Fields")
     
-    # Initialize session state for metadata if not exists
     if 'metadata_state' not in st.session_state:
         st.session_state.metadata_state = {field: True for field in METADATA_FIELDS.keys()}
         st.session_state.all_metadata = True
     
-    # Add Select All / Unselect All buttons
     col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
         all_metadata = st.checkbox("All Metadata Fields", value=st.session_state.all_metadata)
     with col2:
-        if st.button("Select All", key="select_all_meta", disabled=all_metadata):
-            st.session_state.metadata_state = {field: True for field in METADATA_FIELDS.keys()}
-            st.rerun()
+        st.button("Select All", key="select_all_meta", disabled=all_metadata,
+                 on_click=update_metadata_callback, args=(True,))
     with col3:
-        if st.button("Unselect All", key="unselect_all_meta", disabled=all_metadata):
-            # Keep ID always selected
-            st.session_state.metadata_state = {field: (field == "id") for field in METADATA_FIELDS.keys()}
-            st.rerun()
+        st.button("Unselect All", key="unselect_all_meta", disabled=all_metadata,
+                 on_click=update_metadata_callback, args=(False,))
     
-    # Update session state when All Metadata changes
     if all_metadata != st.session_state.all_metadata:
         st.session_state.all_metadata = all_metadata
         if all_metadata:
-            # Check all metadata fields when All Metadata is selected
             st.session_state.metadata_state = {field: True for field in METADATA_FIELDS.keys()}
     
     metadata_categories = {
@@ -733,23 +790,19 @@ def main():
         "Additional Information": ["sustainable_development_goals", "grants", "datasets"]
     }
     
-    selected_metadata = ["id"]  # Always include ID
+    selected_metadata = ["id"]
     
-    # Always show all metadata fields
     for category, fields in metadata_categories.items():
         with st.expander(category, expanded=True):
             field_cols = st.columns(3)
             for i, field in enumerate(fields):
                 with field_cols[i % 3]:
                     if field == "id":
-                        # ID is always selected and disabled
                         st.checkbox(METADATA_FIELDS.get(field, field), value=True, disabled=True, key=f"meta_{field}")
                     elif all_metadata:
-                        # If All Metadata is checked, show as checked but disabled
                         st.checkbox(METADATA_FIELDS.get(field, field), value=True, disabled=True, key=f"meta_{field}")
                         selected_metadata.append(field)
                     else:
-                        # Normal checkbox behavior
                         if st.checkbox(METADATA_FIELDS.get(field, field), 
                                      value=st.session_state.metadata_state.get(field, False), 
                                      key=f"meta_{field}"):
@@ -763,7 +816,7 @@ def main():
     # Phase 3: Retrieve Publications
     st.header("3️⃣ Retrieve Publications")
     
-    # Calculate estimated publications and show warning if needed
+    # Show warning if needed
     if hasattr(st.session_state, 'total_avg_works_per_year') and st.session_state.total_avg_works_per_year > 0:
         years_span = end_year - start_year + 1
         estimated_publications = st.session_state.total_avg_works_per_year * years_span
@@ -781,9 +834,12 @@ def main():
                 f"</ul></div>",
                 unsafe_allow_html=True
             )
-            st.markdown("")  # Add spacing
+            st.markdown("")
     
     if st.button("🚀 Start Retrieval", type="primary"):
+        # Start timing
+        start_time = time.time()
+        
         # Initialize progress tracking
         st.session_state.progress_data = {
             'current_institution': 0,
@@ -792,33 +848,38 @@ def main():
             'publications_fetched': 0
         }
         
-        # Create session
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': f'SIRIS Academic Research Tool/1.0 (mailto:{MAILTO})'
-        })
+        # Get cached session
+        session = get_session()
         
         # Progress placeholders
         progress_bar = st.progress(0)
         status_placeholder = st.empty()
         metrics_placeholder = st.empty()
+        timer_placeholder = st.empty()
         
         all_publications = []
         
-        # Process each institution (collect all publications first, no deduplication yet)
+        # Process each institution with progress updates
+        update_interval = max(1, len(st.session_state.selected_institutions) // 20)
+        
         for i, inst in enumerate(st.session_state.selected_institutions):
             st.session_state.progress_data['current_institution'] = i + 1
             
-            # Update progress
-            progress = (i + 1) / len(st.session_state.selected_institutions)
-            progress_bar.progress(progress)
+            # Update progress at intervals
+            if i % update_interval == 0 or i == len(st.session_state.selected_institutions) - 1:
+                progress = (i + 1) / len(st.session_state.selected_institutions)
+                progress_bar.progress(progress)
+                
+                # Update timer
+                elapsed = time.time() - start_time
+                timer_placeholder.info(f"⏱️ Time elapsed: {timedelta(seconds=int(elapsed))}")
             
             status_placeholder.info(f"Fetching: {inst['display_name']}")
             
-            # Fetch publications
+            # Fetch publications with parallel requests
             lang_filter = "english_only" if language_filter == "English Only" else "all_languages"
             
-            institution_pubs = fetch_publications(
+            institution_pubs = fetch_publications_parallel(
                 session, 
                 inst['openalex_id'], 
                 inst['display_name'],
@@ -826,11 +887,9 @@ def main():
                 end_year, 
                 selected_doc_types,
                 selected_metadata,
-                lang_filter,
-                status_placeholder
+                lang_filter
             )
             
-            # Just append all publications without deduplication
             all_publications.extend(institution_pubs)
             
             # Update metrics
@@ -839,46 +898,35 @@ def main():
                 value=f"{i+1}/{len(st.session_state.selected_institutions)} institutions",
                 delta=f"{len(all_publications)} publications fetched (before deduplication)"
             )
+            
+            # Memory management
+            if len(all_publications) > 10000 and i % 3 == 0:
+                gc.collect()
         
-        # NOW do deduplication only once at the end
+        # Deduplication
         if all_publications:
             status_placeholder.info("Deduplicating publications and merging institution names...")
+            merged_publications = deduplicate_publications_optimized(all_publications)
             
-            pub_dict = {}
-            for pub in all_publications:
-                pub_id = pub.get("id", "")
-                if pub_id:
-                    if pub_id not in pub_dict:
-                        # First occurrence of this publication
-                        pub_dict[pub_id] = pub
-                    else:
-                        # Publication already exists, merge institution names
-                        existing_institutions = pub_dict[pub_id].get("institutions_extracted", "")
-                        new_institution = pub.get("institutions_extracted", "")
-                        
-                        if new_institution:
-                            # Build a set to avoid duplicates, then join
-                            existing_set = set(inst.strip() for inst in existing_institutions.split(" | ") if inst.strip())
-                            existing_set.add(new_institution)
-                            pub_dict[pub_id]["institutions_extracted"] = " | ".join(sorted(existing_set))
-            
-            merged_publications = list(pub_dict.values())
+            # Clear memory
+            del all_publications
+            gc.collect()
             
             # Update final metrics
             metrics_placeholder.metric(
                 label="Final Results",
                 value=f"{len(merged_publications)} unique publications",
-                delta=f"Removed {len(all_publications) - len(merged_publications)} duplicates"
+                delta=f"Processing complete"
             )
             
-            # Create CSV
+            # Create output dataframe
             df_output = pd.DataFrame(merged_publications)
             
-            # Reorder columns to match original format
+            # Reorder columns
             columns_order = ["id"] + [col for col in selected_metadata if col != "id"] + ["institutions_extracted"]
-            df_output = df_output[columns_order]
+            df_output = df_output[[col for col in columns_order if col in df_output.columns]]
             
-            # Rename columns to friendly names
+            # Rename columns
             column_mapping = {field: METADATA_FIELDS.get(field, field) for field in df_output.columns}
             column_mapping["institutions_extracted"] = "Institutions Extracted"
             df_output = df_output.rename(columns=column_mapping)
@@ -887,20 +935,27 @@ def main():
             num_institutions = len(st.session_state.selected_institutions)
             timestamp = datetime.now().strftime("%H%M")
             
+            # Calculate total time
+            total_time = time.time() - start_time
+            timer_placeholder.success(f"✅ Total processing time: {timedelta(seconds=int(total_time))}")
+            
             if output_format == "CSV":
                 filename = f"pubs_{num_institutions}_institutions_{timestamp}.csv"
                 
-                # Convert to CSV with UTF-8 BOM for Excel compatibility
+                # Use streaming for large files
                 csv_buffer = io.StringIO()
-                df_output.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
-                csv_data = csv_buffer.getvalue()
+                if len(df_output) > 50000:
+                    write_csv_streaming(df_output, csv_buffer)
+                else:
+                    df_output.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
                 
-                # Success message and download button
-                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions")
+                csv_data = csv_buffer.getvalue().encode('utf-8-sig')
+                
+                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions in {timedelta(seconds=int(total_time))}")
                 
                 st.download_button(
                     label=f"📥 Download {filename}",
-                    data=csv_data.encode('utf-8-sig'),  # Encode with BOM for Excel
+                    data=csv_data,
                     file_name=filename,
                     mime="text/csv",
                     type="primary"
@@ -908,14 +963,12 @@ def main():
             else:  # Parquet format
                 filename = f"pubs_{num_institutions}_institutions_{timestamp}.parquet"
                 
-                # Convert to Parquet
                 parquet_buffer = io.BytesIO()
                 df_output.to_parquet(parquet_buffer, index=False, compression='snappy')
                 parquet_data = parquet_buffer.getvalue()
                 
-                # Success message and download button
                 file_size_mb = len(parquet_data) / (1024 * 1024)
-                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions (Parquet size: {file_size_mb:.1f} MB)")
+                st.success(f"✅ Retrieved {len(merged_publications)} unique publications from {num_institutions} institutions in {timedelta(seconds=int(total_time))} (Parquet size: {file_size_mb:.1f} MB)")
                 
                 st.download_button(
                     label=f"📥 Download {filename}",
@@ -924,6 +977,10 @@ def main():
                     mime="application/octet-stream",
                     type="primary"
                 )
+            
+            # Final cleanup
+            del df_output
+            gc.collect()
         else:
             st.warning("No publications found for the selected criteria")
 
