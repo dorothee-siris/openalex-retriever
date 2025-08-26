@@ -1,10 +1,10 @@
 # ui/authors.py
-"""Author selection UI for OpenAlex retriever (staged selections, robust)
+"""Author selection UI for OpenAlex retriever (staged + stable)
 - 10 MB upload cap
-- One global Confirm (top + bottom); no per-author confirm
+- Global Confirm (top + bottom); no per-author confirm
 - Single Expand/Collapse-all toggle (works)
 - Select column pinned left; stable row identity (index=ID)
-- NO processing/summary changes until Confirm ALL is clicked
+- No summary/commit until Confirm ALL
 """
 
 from typing import Optional, List, Dict
@@ -45,6 +45,7 @@ def fetch_author_candidates(first_name: str, last_name: str, orcid: Optional[str
     candidates: List[Dict] = []
     seen_ids: set = set()
 
+    # Search by ORCID (but DO NOT stop; still search by name)
     if orcid and str(orcid).strip().lower() not in {"", "nan", "none"}:
         for match in search_author_by_orcid(session, str(orcid).strip()):
             author_id = (match.get("id", "") or "").replace("https://openalex.org/", "")
@@ -54,6 +55,7 @@ def fetch_author_candidates(first_name: str, last_name: str, orcid: Optional[str
                     candidates.append(extract_author_info(details))
                     seen_ids.add(author_id)
 
+    # Also search by name (limit top 10)
     for match in search_author_by_name(session, first_name, last_name)[:10]:
         author_id = (match.get("id", "") or "").replace("https://openalex.org/", "")
         if author_id and author_id not in seen_ids:
@@ -70,8 +72,9 @@ def render_author_selector():
     st.header("1️⃣ Select Authors")
 
     # Init UI state
-    st.session_state.setdefault("author_candidates", {})     # {input_key: {...}}
-    st.session_state.setdefault("staged_selections", {})     # {input_key: set(ids)}
+    st.session_state.setdefault("author_candidates", {})   # {input_key: {...}}
+    st.session_state.setdefault("staged_selections", {})   # {input_key: set(ids)}
+    st.session_state.setdefault("editor_frames", {})       # {input_key: pd.DataFrame (index=ID)}
     st.session_state.setdefault("expand_all_authors", False)
     st.session_state.setdefault("expander_toggle_nonce", 0)
 
@@ -124,9 +127,10 @@ def process_author_file(df: pd.DataFrame, surname_col: str, name_col: str, orcid
     progress = st.progress(0)
     status = st.empty()
 
-    # Reset candidates and staged selections for a new upload
+    # Reset for a new upload
     st.session_state.author_candidates = {}
     st.session_state.staged_selections = {}
+    st.session_state.editor_frames = {}
 
     total = len(df)
     for idx, row in df.iterrows():
@@ -149,7 +153,7 @@ def process_author_file(df: pd.DataFrame, surname_col: str, name_col: str, orcid
             "orcid": orcid,
             "candidates": candidates,
         }
-        st.session_state.staged_selections[key] = set()  # nothing pre-selected
+        st.session_state.staged_selections[key] = set()  # start empty
 
     status.success(f"✅ Found candidates for {len(st.session_state.author_candidates)} authors")
     progress.empty()
@@ -164,7 +168,7 @@ def display_author_candidates():
     c1, c2, c3 = st.columns([1.7, 1.5, 1.9])
     with c1:
         if st.button("⚡ Auto-select best match for each author"):
-            # stage only; do not commit
+            # Stage only; do not commit
             for key, data in st.session_state.author_candidates.items():
                 cands = data["candidates"]
                 if cands:
@@ -177,7 +181,7 @@ def display_author_candidates():
         label = "▾ Expand all" if not st.session_state.expand_all_authors else "▸ Collapse all"
         if st.button(label):
             st.session_state.expand_all_authors = not st.session_state.expand_all_authors
-            st.session_state.expander_toggle_nonce += 1  # force remount
+            st.session_state.expander_toggle_nonce += 1  # force remount so expanded= applies
             st.rerun()
 
     with c3:
@@ -186,8 +190,10 @@ def display_author_candidates():
             st.success("All selections confirmed.")
             st.rerun()
 
-    # Suffix to force expander remount so 'expanded' is honored
+    # Suffix toggles to remount expanders
     nonce_suffix = "\u200b" * (st.session_state.expander_toggle_nonce % 2)
+
+    frames = st.session_state.editor_frames  # persistent per-author tables
 
     # Per-author panels (pure staging; no committing)
     for key, data in st.session_state.author_candidates.items():
@@ -200,28 +206,28 @@ def display_author_candidates():
 
             staged = st.session_state.staged_selections.get(key, set())
 
-            # Build with Select first, stable identity (index=ID)
-            rows = []
-            for c in cands:
-                cid = c.get("id", "")
-                rows.append({
-                    "Select": cid in staged,
-                    "Name": c.get("display_name", ""),
-                    "ID": cid,
-                    "ORCID": c.get("orcid", ""),
-                    "Publications": c.get("works_count", 0),
-                    "Affiliations": ", ".join(c.get("affiliations", [])[:2]),
-                    "Topics": ", ".join(c.get("topics", [])[:3]),
-                })
+            # Create table once, or rebuild if candidate IDs changed
+            if key not in frames:
+                frames[key] = _build_editor_frame(cands, staged)
+            else:
+                df = frames[key]
+                current_ids = list(df.index)
+                new_ids = [c.get("id", "") for c in cands]
+                if current_ids != new_ids:
+                    frames[key] = _build_editor_frame(cands, staged)
+                else:
+                    # Keep existing object; just sync Select from staged
+                    df["Select"] = df.index.isin(staged)
 
-            cols = ["Select", "Name", "ID", "ORCID", "Publications", "Affiliations", "Topics"]
-            df_display = pd.DataFrame(rows, columns=cols).set_index("ID")
+            df_display = frames[key]
 
+            # Stable object; stable key
             edited = st.data_editor(
                 df_display,
                 hide_index=True,
                 use_container_width=True,
                 num_rows="fixed",
+                column_order=["Select", "Name", "ORCID", "Publications", "Affiliations", "Topics"],
                 column_config={
                     "Select": st.column_config.CheckboxColumn("Select", help="Tick to stage this profile"),
                     "Publications": st.column_config.NumberColumn("Publications", format="%d"),
@@ -230,11 +236,12 @@ def display_author_candidates():
                 key=f"editor_{key}",
             )
 
-            # Update staged selection only (no commit, no summary updates)
-            staged_now = {idx for idx, val in edited["Select"].items() if bool(val)}
-            st.session_state.staged_selections[key] = staged_now
+            # Update staged set from edited table; mirror back to stored frame (no rebuild)
+            sel_series = edited["Select"].astype(bool).fillna(False)
+            st.session_state.staged_selections[key] = set(sel_series[sel_series].index)
+            frames[key]["Select"] = sel_series
 
-    # ---- Committed summary (does NOT react to staging) ----
+    # ---- Committed summary (ONLY after Confirm) ----
     st.divider()
     committed_authors = [e for e in st.session_state.get("selected_entities", []) if e.get("type") == "author"]
     committed_profiles = len(committed_authors)
@@ -254,12 +261,13 @@ def display_author_candidates():
 # ---------- Commit helpers ----------
 
 def commit_all_selected_authors():
-    """Commit staged selections into selected_entities. Only this changes summary & unlocks next sections."""
+    """Commit staged selections into selected_entities. Only this unlocks next sections & updates summary."""
     if "author_candidates" not in st.session_state:
         return
 
     input_keys = set(st.session_state.author_candidates.keys())
     st.session_state.setdefault("selected_entities", [])
+
     # Drop previous committed selections for the current upload
     st.session_state.selected_entities = [
         e for e in st.session_state.selected_entities
@@ -270,9 +278,9 @@ def commit_all_selected_authors():
     for key, data in st.session_state.author_candidates.items():
         surname = data["surname"]
         name = data["name"]
-        cands = {c["id"]: c for c in data["candidates"]}
+        cands_by_id = {c["id"]: c for c in data["candidates"]}
         for sid in st.session_state.staged_selections.get(key, set()):
-            cand = cands.get(sid)
+            cand = cands_by_id.get(sid)
             if not cand:
                 continue
             st.session_state.selected_entities.append({
@@ -281,6 +289,26 @@ def commit_all_selected_authors():
                 "label": f"{surname.upper()} {name} → {cand.get('display_name', '')}",
                 "metadata": {**cand, "input_key": key},
             })
+
+# ---------- Editor frame builder ----------
+
+def _build_editor_frame(cands: List[Dict], staged: set) -> pd.DataFrame:
+    """Create the editor DataFrame once, with stable row identity (index=ID)."""
+    rows = []
+    for c in cands:
+        cid = c.get("id", "")
+        rows.append({
+            "ID": cid,
+            "Select": cid in staged,
+            "Name": c.get("display_name", ""),
+            "ORCID": c.get("orcid", ""),
+            "Publications": c.get("works_count", 0),
+            "Affiliations": ", ".join(c.get("affiliations", [])[:2]),
+            "Topics": ", ".join(c.get("topics", [])[:3]),
+        })
+    df = pd.DataFrame(rows).set_index("ID")
+    df["Select"] = df["Select"].astype(bool)
+    return df
 
 # ---------- Data extraction utils ----------
 
