@@ -2,7 +2,7 @@
 """Author selection UI for OpenAlex retriever (parallel candidate fetch, form-based stable UI)
 - Removes ORCID matching (name search only)
 - Parallel candidate discovery for speed
-- Up to 20 profiles per author
+- Up to 20 profiles per author (from /authors search only; no extra details calls)
 - One big form: ticking checkboxes does NOT rerun the app
 - Single Confirm button at bottom
 - Per-author tables are stable (index=ID); persistent frames for display
@@ -18,13 +18,11 @@ import streamlit as st
 
 from core.api_client import (
     get_session,
-    search_author_by_name,
-    get_author_details,
+    search_author_by_name,    # <- we only use this now
 )
 
 # ---------- Config for parallel fetch ----------
-# Local worker count (kept here so you don't have to change core/api_client.py)
-WORKERS = 8  # tune 6–10 safely; global rate limiter still keeps requests polite
+WORKERS = 10  # tune 8–12; polite pool still honored by api_client's rate limiter
 
 
 # ---------- Small helpers ----------
@@ -45,32 +43,34 @@ def _zwsp_salt(key: str) -> str:
     return "\u200b" * count  # zero-width space(s)
 
 
-# ---------- Data extraction utils ----------
+# ---------- Candidate extraction from /authors results ----------
 
-def extract_author_info(author_data: Dict) -> Dict:
+def _candidate_from_authors_result(match: Dict) -> Dict:
+    """Build a candidate row from an /authors search result (no /people details call)."""
+    # Basic fields
+    openalex_id = (match.get("id", "") or "").replace("https://openalex.org/", "")
+    display_name = match.get("display_name", "") or ""
+    orcid = (match.get("orcid", "") or "").replace("https://orcid.org/", "")
+    works_count = match.get("works_count", 0) or 0
+
+    # Affiliations from last_known_institutions (if present)
     affiliations: List[str] = []
-
-    if isinstance(author_data.get("affiliations"), list):
-        for aff in author_data["affiliations"][:3]:
-            inst = aff.get("institution") if isinstance(aff, dict) else None
-            if inst:
+    lki = match.get("last_known_institutions") or []
+    if isinstance(lki, list):
+        for inst in lki[:2]:
+            if isinstance(inst, dict):
                 affiliations.append(f"{inst.get('display_name', '')} ({inst.get('country_code', '')})")
 
-    if isinstance(author_data.get("last_known_institutions"), list):
-        for inst in author_data["last_known_institutions"][:2]:
-            s = f"{inst.get('display_name', '')} ({inst.get('country_code', '')})"
-            if s and s not in affiliations:
-                affiliations.append(s)
-
+    # Topics not always present on /authors; use if available
     topics: List[str] = []
-    if isinstance(author_data.get("topics"), list):
-        topics = [t.get("display_name", "") for t in author_data["topics"][:5]]
+    if isinstance(match.get("topics"), list):
+        topics = [t.get("display_name", "") for t in match["topics"][:5]]
 
     return {
-        "id": (author_data.get("id", "") or "").replace("https://openalex.org/", ""),
-        "display_name": author_data.get("display_name", ""),
-        "orcid": (author_data.get("orcid", "") or "").replace("https://orcid.org/", ""),
-        "works_count": author_data.get("works_count", 0),
+        "id": openalex_id,
+        "display_name": display_name,
+        "orcid": orcid,
+        "works_count": works_count,
         "affiliations": affiliations,
         "topics": topics,
     }
@@ -80,20 +80,26 @@ def extract_author_info(author_data: Dict) -> Dict:
 
 def _build_editor_frame(cands: List[Dict], checked_ids: set) -> pd.DataFrame:
     """Create a persistent editor DataFrame with stable row identity (index=ID)."""
+    # Ensure we always have the columns so set_index('ID') never fails
+    base_cols = ["ID", "Select", "Name", "ORCID", "Publications", "Affiliations", "Topics"]
     rows = []
-    for c in cands:
+    for c in cands or []:
         cid = c.get("id", "")
         rows.append({
             "ID": cid,
             "Select": cid in checked_ids,
             "Name": c.get("display_name", ""),
-            "ORCID": c.get("orcid", ""),  # retained for visibility; not used for matching
+            "ORCID": c.get("orcid", ""),
             "Publications": c.get("works_count", 0),
             "Affiliations": ", ".join(c.get("affiliations", [])[:2]),
             "Topics": ", ".join(c.get("topics", [])[:3]),
         })
-    df = pd.DataFrame(rows).set_index("ID")
-    df["Select"] = df["Select"].astype(bool)
+
+    df = pd.DataFrame(rows, columns=base_cols)
+    # Even if empty, this works because the "ID" column exists
+    df = df.set_index("ID")
+    if "Select" in df.columns:
+        df["Select"] = df["Select"].astype(bool)
     return df
 
 
@@ -104,22 +110,16 @@ def _make_session_pool(n: int) -> List:
     return [get_session() for _ in range(n)]
 
 def _fetch_candidates_for_one(session, first: str, last: str) -> Dict:
-    """Name search only. Return a payload with top 20 detailed candidates."""
+    """Name search only. Return a payload with up to 20 candidates built from /authors results."""
     candidates: List[Dict] = []
-    seen_ids = set()
-
     try:
-        # Fetch name matches; cap at 20
-        matches = search_author_by_name(session, first, last)[:20]
-        for match in matches:
-            aid = (match.get("id", "") or "").replace("https://openalex.org/", "")
-            if not aid or aid in seen_ids:
-                continue
-            details = get_author_details(session, aid)
-            if details:
-                candidates.append(extract_author_info(details))
-                seen_ids.add(aid)
+        matches = search_author_by_name(session, first, last) or []
+        # keep top 20
+        matches = matches[:20]
+        for m in matches:
+            candidates.append(_candidate_from_authors_result(m))
     except Exception:
+        # swallow this person; the UI will show "No matches found."
         pass
 
     # Best-first by works_count
@@ -146,8 +146,8 @@ def prefetch_author_candidates_parallel(df: pd.DataFrame, surname_col: str, name
         s = sessions[idx % WORKERS]
         payload = _fetch_candidates_for_one(s, name, surname)  # first=name, last=surname
         payload.update({
-            "input_name": f"{surname}, {name}",      # original file format if ever needed
-            "input_name_file_order": f"{name}, {surname}",  # for UI headers
+            "input_name": f"{surname}, {name}",            # original file format if ever needed
+            "input_name_file_order": f"{name}, {surname}", # for UI headers
             "surname": surname,
             "name": name,
             "selected": []
@@ -251,9 +251,11 @@ def display_author_candidates():
                 cands = data["candidates"]
                 if not cands:
                     st.warning("No matches found.")
-                    continue
+                    # still render an empty, but stable, editor so the form always returns something
+                    df_display = _build_editor_frame([], checked_ids=set())
+                else:
+                    df_display = st.session_state.editor_frames[key]
 
-                df_display = st.session_state.editor_frames[key]
                 edited_df = st.data_editor(
                     df_display,
                     hide_index=True,
@@ -305,8 +307,11 @@ def prefill_best_matches():
         if not cands:
             continue
         best = max(cands, key=lambda x: x.get("works_count", 0))
-        df = st.session_state.editor_frames[key]
-        df["Select"] = df.index == best["id"]
+        df = st.session_state.editor_frames.get(key)
+        if df is None or df.empty or best.get("id", "") not in df.index:
+            continue
+        df.loc[:, "Select"] = False
+        df.loc[best["id"], "Select"] = True
     st.session_state.prefilled = True
 
 def commit_all_selected_authors(form_edits: Dict[str, pd.DataFrame]):
@@ -334,6 +339,7 @@ def commit_all_selected_authors(form_edits: Dict[str, pd.DataFrame]):
             if "ID" in edited_df.columns:
                 edited_df = edited_df.set_index("ID")
             else:
+                # truly empty / malformed editor; skip
                 continue
 
         selected_ids = list(edited_df.index[edited_df["Select"].astype(bool)])
@@ -347,7 +353,7 @@ def commit_all_selected_authors(form_edits: Dict[str, pd.DataFrame]):
             st.session_state.selected_entities.append({
                 "type": "author",
                 "id": sid,
-                # keep your UI label if you like
+                # UI label can keep the OA display name for clarity
                 "label": f"{data['surname'].upper()} {data['name']} → {cand.get('display_name', '')}",
                 # use Name, Surname from the uploaded file for output columns
                 "file_label": f"{data['name']}, {data['surname']}",
