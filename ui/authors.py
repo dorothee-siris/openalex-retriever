@@ -2,7 +2,7 @@
 """Author selection UI for OpenAlex retriever (enhanced)
 - Cap upload at 10 MB
 - Global confirm (top and bottom), no per-author confirm
-- Expand/Collapse all author panels
+- Single Expand/Collapse all toggle (robust)
 - Show number of names to review
 - Compact summary of selected profiles & total works at the end
 """
@@ -84,6 +84,8 @@ def render_author_selector():
     # Init UI state
     st.session_state.setdefault("author_candidates", {})
     st.session_state.setdefault("expand_all_authors", False)
+    # Used to force a remount of expanders so 'expanded' param takes effect
+    st.session_state.setdefault("expander_toggle_nonce", 0)
 
     uploaded_file = st.file_uploader(
         "Upload Excel file with author names",
@@ -183,8 +185,8 @@ def display_author_candidates():
     total_names = len(st.session_state.author_candidates)
     st.info(f"🧾 Names to review: **{total_names}**")
 
-    # Top actions row (auto-select, global confirm, expand/collapse)
-    c1, c2, c3, c4 = st.columns([1.6, 1.8, 1.2, 1.2])
+    # Top actions row (auto-select, expand/collapse toggle, global confirm)
+    c1, c2, c3 = st.columns([1.7, 1.5, 1.9])
     with c1:
         if st.button("⚡ Auto-select best match for each author"):
             for key, data in st.session_state.author_candidates.items():
@@ -195,24 +197,29 @@ def display_author_candidates():
             st.rerun()
 
     with c2:
+        # Single toggle button that flips expand/collapse for all
+        is_expanded = st.session_state.expand_all_authors
+        label = "▾ Expand all" if not is_expanded else "▸ Collapse all"
+        if st.button(label):
+            st.session_state.expand_all_authors = not is_expanded
+            # Force remount of all expanders by changing a nonce used in their labels
+            st.session_state.expander_toggle_nonce += 1
+            st.rerun()
+
+    with c3:
         if st.button("✅ Confirm ALL selections (add to list)"):
             commit_all_selected_authors()
             st.success("All selections confirmed.")
             st.rerun()
 
-    with c3:
-        if st.button("▾ Expand all"):
-            st.session_state.expand_all_authors = True
-            st.rerun()
-
-    with c4:
-        if st.button("▸ Collapse all"):
-            st.session_state.expand_all_authors = False
-            st.rerun()
+    # Build a suffix that changes whenever the toggle flips; this forces expander remount
+    nonce_suffix = "\u200b" * (st.session_state.expander_toggle_nonce % 2)
 
     # Per-author panels
     for key, data in st.session_state.author_candidates.items():
-        with st.expander(f"📝 {data['input_name']}", expanded=st.session_state.expand_all_authors):
+        # Changing the label by a tiny zero-width suffix forces a new widget -> expanded param is honored
+        label = f"📝 {data['input_name']}{nonce_suffix}"
+        with st.expander(label, expanded=st.session_state.expand_all_authors):
             cands = data["candidates"]
             if not cands:
                 st.warning("No matches found.")
