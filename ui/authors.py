@@ -2,9 +2,9 @@
 """Author selection UI for OpenAlex retriever (form-based, no flicker, safe submit)
 - 10 MB upload cap
 - One big form: ticking checkboxes does NOT rerun the app
-- Two global Confirm buttons (top and bottom of the form)
+- Two global Confirm buttons (top and bottom) with unique keys
 - Per-author tables are stable (index=ID); persistent frames for display
-- On submit, we read the editors' return DataFrames (not session_state) and commit
+- On submit, we read the editors' return DataFrames and commit
 - Summary updates ONLY after Confirm ALL
 """
 
@@ -173,14 +173,18 @@ def display_author_candidates():
 
     # ---- BIG FORM: ticking inside does NOT rerun ----
     with st.form("authors_selection_form", clear_on_submit=False):
-        # Top submit (user asked for top & bottom)
-        submitted_top = st.form_submit_button("✅ Confirm ALL selections (add to list)", type="primary")
+        # Top submit (unique key!)
+        submitted_top = st.form_submit_button(
+            "✅ Confirm ALL selections (add to list)", type="primary", use_container_width=False, key="submit_top_authors"
+        )
 
         # Capture editors' return values per author
         form_edits: Dict[str, pd.DataFrame] = {}
 
         for key, data in st.session_state.author_candidates.items():
-            with st.expander(f"📝 {data['input_name']}", expanded=False):
+            # To reduce chance of duplicate expander IDs if names repeat, add a tiny unique suffix
+            label = f"📝 {data['input_name']} \u200b{key}"
+            with st.expander(label, expanded=False):
                 cands = data["candidates"]
                 if not cands:
                     st.warning("No matches found.")
@@ -203,7 +207,10 @@ def display_author_candidates():
                 # Store the returned DataFrame (real pandas object)
                 form_edits[key] = edited_df
 
-        submitted_bottom = st.form_submit_button("✅ Confirm ALL selections (add to list)", type="primary")
+        # Bottom submit (unique key!)
+        submitted_bottom = st.form_submit_button(
+            "✅ Confirm ALL selections (add to list)", type="primary", use_container_width=False, key="submit_bottom_authors"
+        )
 
     submitted = submitted_top or submitted_bottom
 
@@ -264,7 +271,6 @@ def commit_all_selected_authors(form_edits: Dict[str, pd.DataFrame]):
 
         # Ensure index=ID is preserved; if not, try to recover
         if edited_df.index.name != "ID":
-            # If ID became a column, restore index; otherwise skip gracefully
             if "ID" in edited_df.columns:
                 edited_df = edited_df.set_index("ID")
             else:
