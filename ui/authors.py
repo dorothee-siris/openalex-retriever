@@ -1,9 +1,10 @@
 # ui/authors.py
-"""Author selection UI for OpenAlex retriever (form-based, no flicker)
+"""Author selection UI for OpenAlex retriever (form-based, no flicker, safe submit)
 - 10 MB upload cap
-- Single global Confirm (top + bottom) inside a form (no reruns on ticking)
-- Manual expanders per author (clicking an expander does not rerun)
-- Persistent editor frames per author; stable row identity (index=ID)
+- One big form: ticking checkboxes does NOT rerun the app
+- Two global Confirm buttons (top and bottom of the form)
+- Per-author tables are stable (index=ID); persistent frames for display
+- On submit, we read the editors' return DataFrames (not session_state) and commit
 - Summary updates ONLY after Confirm ALL
 """
 
@@ -164,15 +165,20 @@ def display_author_candidates():
     total_names = len(st.session_state.author_candidates)
     st.info(f"🧾 Names to review: **{total_names}**")
 
-    # Optional: Pre-fill best matches (will reset current unsaved ticks since the form hasn't submitted yet)
+    # Optional prefill (best match by works_count)
     if st.button("⚡ Prefill best match for each author (optional)"):
         prefill_best_matches()
         st.success("Prefilled best matches. You can adjust before confirming.")
-        st.rerun()  # apply prefill
+        st.rerun()
 
-    # ---- BIG FORM: no reruns when ticking inside it ----
+    # ---- BIG FORM: ticking inside does NOT rerun ----
     with st.form("authors_selection_form", clear_on_submit=False):
-        # One expander per author, each with a data_editor tied to a persistent frame
+        # Top submit (user asked for top & bottom)
+        submitted_top = st.form_submit_button("✅ Confirm ALL selections (add to list)", type="primary")
+
+        # Capture editors' return values per author
+        form_edits: Dict[str, pd.DataFrame] = {}
+
         for key, data in st.session_state.author_candidates.items():
             with st.expander(f"📝 {data['input_name']}", expanded=False):
                 cands = data["candidates"]
@@ -181,8 +187,7 @@ def display_author_candidates():
                     continue
 
                 df_display = st.session_state.editor_frames[key]
-                # Render editor (stable object & key); ticking won't rerun
-                st.data_editor(
+                edited_df = st.data_editor(
                     df_display,
                     hide_index=True,
                     use_container_width=True,
@@ -195,19 +200,19 @@ def display_author_candidates():
                     disabled=["Name", "ORCID", "Publications", "Affiliations", "Topics"],
                     key=f"editor_{key}",
                 )
+                # Store the returned DataFrame (real pandas object)
+                form_edits[key] = edited_df
 
-        # Submit buttons (top and bottom not both possible in one form block; we add bottom here)
-        submitted = st.form_submit_button("✅ Confirm ALL selections (add to list)", type="primary")
+        submitted_bottom = st.form_submit_button("✅ Confirm ALL selections (add to list)", type="primary")
 
-    # Process submission outside the form
+    submitted = submitted_top or submitted_bottom
+
     if submitted:
-        commit_all_selected_authors()
+        commit_all_selected_authors(form_edits)
         st.success("All selections confirmed.")
-        # Show updated committed summary right away
         show_committed_summary()
-
     else:
-        # Show current committed summary (unchanged until submit)
+        # Committed summary stays unchanged until confirm
         show_committed_summary()
 
 def show_committed_summary():
@@ -237,8 +242,8 @@ def prefill_best_matches():
         df["Select"] = df.index == best["id"]
     st.session_state.prefilled = True
 
-def commit_all_selected_authors():
-    """Read all data_editors from session state and commit selected profiles."""
+def commit_all_selected_authors(form_edits: Dict[str, pd.DataFrame]):
+    """Commit selected profiles using the editors' returned DataFrames from the form."""
     if "author_candidates" not in st.session_state:
         return
 
@@ -251,16 +256,20 @@ def commit_all_selected_authors():
         if not (e.get("type") == "author" and e.get("metadata", {}).get("input_key") in input_keys)
     ]
 
-    # Commit from the form editors' current content
+    # Iterate over the edited DataFrames captured from the form
     for key, data in st.session_state.author_candidates.items():
-        df_key = f"editor_{key}"
-        if df_key not in st.session_state:
-            # Fall back to the persistent frame if needed
-            edited_df = st.session_state.editor_frames[key]
-        else:
-            edited_df = st.session_state[df_key]
+        edited_df = form_edits.get(key)
+        if edited_df is None or "Select" not in edited_df.columns:
+            continue
 
-        # edited_df has index=ID and a "Select" boolean column
+        # Ensure index=ID is preserved; if not, try to recover
+        if edited_df.index.name != "ID":
+            # If ID became a column, restore index; otherwise skip gracefully
+            if "ID" in edited_df.columns:
+                edited_df = edited_df.set_index("ID")
+            else:
+                continue
+
         selected_ids = list(edited_df.index[edited_df["Select"].astype(bool)])
 
         # Map to candidate dicts for metadata
