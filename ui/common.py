@@ -278,10 +278,16 @@ def retrieve_publications():
         # Fetch publications
         lang_filter = "english_only" if config['language_filter'] == "English Only" else "all_languages"
         
+        # use the input-file name "Surname, Name" for authors; keep label for institutions
+        name_for_output = (
+            entity['label'] if entity['type'] == 'institution'
+            else entity.get('file_label', entity['label'])
+        )
+
         entity_pubs = fetch_publications_parallel(
             session,
             entity['id'],
-            entity['label'],
+            name_for_output,
             entity['type'],
             config['start_year'],
             config['end_year'],

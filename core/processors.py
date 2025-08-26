@@ -104,35 +104,53 @@ def process_publications_batch(results: List[Dict], entity_id: str, entity_name:
     return publications
 
 def deduplicate_publications_optimized(all_publications: List[Dict]) -> List[Dict]:
-    """Optimized deduplication using sets and single pass"""
-    seen = {}
-    
+    """Merge duplicates by work id.
+    - Combine institutions (set)
+    - Combine matched authors from the user list (map: 'Surname, Name' -> position)
+    - Output aligned pipes: 'Authors Extracted' and 'Author Position'
+    """
+    seen: Dict[str, Dict] = {}
+
     for pub in all_publications:
         pub_id = pub.get("id", "")
-        if pub_id:
-            if pub_id not in seen:
-                seen[pub_id] = {
-                    'data': pub,
-                    'institutions': {pub.get("institutions_extracted", "")} if pub.get("institutions_extracted") else set(),
-                    'authors': {pub.get("authors_extracted", "")} if pub.get("authors_extracted") else set()
-                }
-            else:
-                # Merge entity information
-                inst = pub.get("institutions_extracted", "")
-                if inst:
-                    seen[pub_id]['institutions'].add(inst)
-                auth = pub.get("authors_extracted", "")
-                if auth:
-                    seen[pub_id]['authors'].add(auth)
-    
-    # Build final list with merged entities
-    result = []
+        if not pub_id:
+            continue
+
+        entry = seen.get(pub_id)
+        if not entry:
+            entry = {
+                "data": pub,
+                "institutions": set(),
+                "author_positions": {},  # { "Surname, Name": "First/Middle/Last/Not found" }
+            }
+            seen[pub_id] = entry
+
+        inst = (pub.get("institutions_extracted") or "").strip()
+        if inst:
+            entry["institutions"].add(inst)
+
+        author_label = (pub.get("authors_extracted") or "").strip()    # this is now "Surname, Name"
+        position = (pub.get("position_extracted") or "").strip()
+        if author_label:
+            # don't overwrite an existing position unless the new one is non-empty
+            if author_label not in entry["author_positions"] or not entry["author_positions"][author_label]:
+                entry["author_positions"][author_label] = position
+
+    # Build final rows
+    result: List[Dict] = []
     for item in seen.values():
-        pub_data = item['data'].copy()
-        pub_data['institutions_extracted'] = ' | '.join(sorted(filter(None, item['institutions'])))
-        pub_data['authors_extracted'] = ' | '.join(sorted(filter(None, item['authors'])))
-        result.append(pub_data)
-    
+        row = item["data"].copy()
+
+        inst_list = sorted(filter(None, item["institutions"]))
+        # sort authors alphabetically for a stable order
+        author_labels = sorted(item["author_positions"].keys())
+
+        row["institutions_extracted"] = " | ".join(inst_list)
+        row["authors_extracted"] = " | ".join(author_labels)
+        row["position_extracted"] = " | ".join(item["author_positions"].get(a, "") for a in author_labels)
+
+        result.append(row)
+
     return result
 
 def fetch_single_doc_type(session, url: str, base_filter_str: str, doc_type: str, 
