@@ -1,13 +1,16 @@
 # ui/authors.py
 """Author selection UI for OpenAlex retriever (parallel candidate fetch, form-based stable UI)
-- Removes ORCID matching (name search only)
+- Name search only (no ORCID, no /people details calls)
 - Parallel candidate discovery for speed
-- Up to 20 profiles per author (from /authors search only; no extra details calls)
+- Up to 20 profiles per author (from /authors search)
 - One big form: ticking checkboxes does NOT rerun the app
 - Single Confirm button at bottom
 - Per-author tables are stable (index=ID); persistent frames for display
-- On submit, we read the editors' return DataFrames and commit
 - Summary updates ONLY after Confirm ALL
+- NEW: Two columns in candidate table:
+    * 'Affiliations 2025' — affiliations whose 'years' include 2025
+    * 'Last known institutions' — from last_known_institutions
+  Both formatted as 'Display Name, CC' joined with ' | '
 """
 
 from typing import Optional, List, Dict, Tuple
@@ -18,11 +21,11 @@ import streamlit as st
 
 from core.api_client import (
     get_session,
-    search_author_by_name,    # <- we only use this now
+    search_author_by_name,    # name-only search
 )
 
 # ---------- Config for parallel fetch ----------
-WORKERS = 10  # tune 8–12; polite pool still honored by api_client's rate limiter
+WORKERS = 10  # tune 8–12 safely; global rate limiter still keeps requests polite
 
 
 # ---------- Small helpers ----------
@@ -45,6 +48,11 @@ def _zwsp_salt(key: str) -> str:
 
 # ---------- Candidate extraction from /authors results ----------
 
+def _fmt_inst(display_name: str, cc: str) -> str:
+    dn = display_name or ""
+    cc = (cc or "").upper()
+    return f"{dn}, {cc}".strip().strip(",")  # avoid dangling comma if cc empty
+
 def _candidate_from_authors_result(match: Dict) -> Dict:
     """Build a candidate row from an /authors search result (no /people details call)."""
     # Basic fields
@@ -53,15 +61,27 @@ def _candidate_from_authors_result(match: Dict) -> Dict:
     orcid = (match.get("orcid", "") or "").replace("https://orcid.org/", "")
     works_count = match.get("works_count", 0) or 0
 
-    # Affiliations from last_known_institutions (if present)
-    affiliations: List[str] = []
+    # 1) Affiliations 2025: from 'affiliations' list where 2025 in 'years'
+    aff_2025_list: List[str] = []
+    affs = match.get("affiliations") or []
+    if isinstance(affs, list):
+        for aff in affs:
+            if not isinstance(aff, dict):
+                continue
+            years = aff.get("years") or []
+            if 2025 in years:
+                inst = aff.get("institution") or {}
+                aff_2025_list.append(_fmt_inst(inst.get("display_name", ""), inst.get("country_code", "")))
+
+    # 2) Last known institutions
+    lki_list: List[str] = []
     lki = match.get("last_known_institutions") or []
     if isinstance(lki, list):
-        for inst in lki[:2]:
+        for inst in lki:
             if isinstance(inst, dict):
-                affiliations.append(f"{inst.get('display_name', '')} ({inst.get('country_code', '')})")
+                lki_list.append(_fmt_inst(inst.get("display_name", ""), inst.get("country_code", "")))
 
-    # Topics not always present on /authors; use if available
+    # Topics sometimes present on /authors; keep if available
     topics: List[str] = []
     if isinstance(match.get("topics"), list):
         topics = [t.get("display_name", "") for t in match["topics"][:5]]
@@ -71,7 +91,8 @@ def _candidate_from_authors_result(match: Dict) -> Dict:
         "display_name": display_name,
         "orcid": orcid,
         "works_count": works_count,
-        "affiliations": affiliations,
+        "affiliations_2025": aff_2025_list,      # NEW
+        "last_known_insts": lki_list,            # NEW
         "topics": topics,
     }
 
@@ -81,7 +102,10 @@ def _candidate_from_authors_result(match: Dict) -> Dict:
 def _build_editor_frame(cands: List[Dict], checked_ids: set) -> pd.DataFrame:
     """Create a persistent editor DataFrame with stable row identity (index=ID)."""
     # Ensure we always have the columns so set_index('ID') never fails
-    base_cols = ["ID", "Select", "Name", "ORCID", "Publications", "Affiliations", "Topics"]
+    base_cols = [
+        "ID", "Select", "Name", "ORCID", "Publications",
+        "Affiliations 2025", "Last known institutions", "Topics"
+    ]
     rows = []
     for c in cands or []:
         cid = c.get("id", "")
@@ -91,8 +115,9 @@ def _build_editor_frame(cands: List[Dict], checked_ids: set) -> pd.DataFrame:
             "Name": c.get("display_name", ""),
             "ORCID": c.get("orcid", ""),
             "Publications": c.get("works_count", 0),
-            "Affiliations": ", ".join(c.get("affiliations", [])[:2]),
-            "Topics": ", ".join(c.get("topics", [])[:3]),
+            "Affiliations 2025": " | ".join(c.get("affiliations_2025", [])[:4]),
+            "Last known institutions": " | ".join(c.get("last_known_insts", [])[:4]),
+            "Topics": " | ".join(c.get("topics", [])[:3]),
         })
 
     df = pd.DataFrame(rows, columns=base_cols)
@@ -245,13 +270,11 @@ def display_author_candidates():
             st.session_state.author_candidates.items(),
             key=lambda kv: (kv[1]["name"].lower(), kv[1]["surname"].lower())
         ):
-            # Add invisible salt so labels are unique (not shown)
             label = f"📝 {data['input_name_file_order']}{_zwsp_salt(key)}"
             with st.expander(label, expanded=False):
                 cands = data["candidates"]
                 if not cands:
                     st.warning("No matches found.")
-                    # still render an empty, but stable, editor so the form always returns something
                     df_display = _build_editor_frame([], checked_ids=set())
                 else:
                     df_display = st.session_state.editor_frames[key]
@@ -261,18 +284,19 @@ def display_author_candidates():
                     hide_index=True,
                     use_container_width=True,
                     num_rows="fixed",
-                    column_order=["Select", "Name", "ORCID", "Publications", "Affiliations", "Topics"],
+                    column_order=[
+                        "Select", "Name", "ORCID", "Publications",
+                        "Affiliations 2025", "Last known institutions", "Topics"
+                    ],
                     column_config={
                         "Select": st.column_config.CheckboxColumn("Select", help="Tick to choose this profile"),
                         "Publications": st.column_config.NumberColumn("Publications", format="%d"),
                     },
-                    disabled=["Name", "ORCID", "Publications", "Affiliations", "Topics"],
+                    disabled=["Name", "ORCID", "Publications", "Affiliations 2025", "Last known institutions", "Topics"],
                     key=f"editor_{key}",
                 )
-                # Store the returned DataFrame (real pandas object)
                 form_edits[key] = edited_df
 
-        # Single bottom submit
         submitted = st.form_submit_button("✅ Confirm ALL selections", type="primary")
 
     if submitted:
@@ -280,7 +304,6 @@ def display_author_candidates():
         st.success("All selections confirmed.")
         show_committed_summary()
     else:
-        # Committed summary stays unchanged until confirm
         show_committed_summary()
 
 def show_committed_summary():
@@ -339,7 +362,6 @@ def commit_all_selected_authors(form_edits: Dict[str, pd.DataFrame]):
             if "ID" in edited_df.columns:
                 edited_df = edited_df.set_index("ID")
             else:
-                # truly empty / malformed editor; skip
                 continue
 
         selected_ids = list(edited_df.index[edited_df["Select"].astype(bool)])
@@ -353,10 +375,7 @@ def commit_all_selected_authors(form_edits: Dict[str, pd.DataFrame]):
             st.session_state.selected_entities.append({
                 "type": "author",
                 "id": sid,
-                # UI label can keep the OA display name for clarity
                 "label": f"{data['surname'].upper()} {data['name']} → {cand.get('display_name', '')}",
-                # use Name, Surname from the uploaded file for output columns
                 "file_label": f"{data['name']}, {data['surname']}",
-                # stash input key & components
                 "metadata": {**cand, "input_key": key, "file_surname": data["surname"], "file_name": data["name"]},
             })
