@@ -16,6 +16,22 @@ MAX_WORKERS = 3
 last_request_time = 0
 rate_lock = threading.Lock()
 
+# core/api_client.py
+MAX_AUTHOR_WORKERS = 8  # tune 6–10 safely for polite pool
+
+def make_session_pool(n: int) -> list[requests.Session]:
+    """Create n independent sessions (requests.Session is not strictly thread-safe)."""
+    pool = []
+    for _ in range(n):
+        s = requests.Session()
+        s.headers.update({'User-Agent': f'SIRIS Academic Research Tool/1.0 (mailto:{MAILTO})'})
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=3)
+        s.mount('http://', adapter)
+        s.mount('https://', adapter)
+        pool.append(s)
+    return pool
+
+
 def get_session() -> requests.Session:
     """Create and cache a requests session with connection pooling"""
     session = requests.Session()
@@ -73,9 +89,12 @@ def search_author_by_name(session: requests.Session, first_name: str, last_name:
     url = "https://api.openalex.org/authors"
     params = {
         "search": f"{first_name} {last_name}",
+        "per_page": 25,
         "mailto": MAILTO
     }
-    
+    return _search_authors(session, url, params)
+
+def _search_authors(session, url, params):
     response = rate_limited_get(session, url, params=params, delay=AUTHORS_DELAY)
     if response and response.status_code == 200:
         data = response.json()
