@@ -2,7 +2,7 @@
 """Author selection UI for OpenAlex retriever (form-based, no flicker, safe submit)
 - 10 MB upload cap
 - One big form: ticking checkboxes does NOT rerun the app
-- Two global Confirm buttons (top and bottom) with unique labels (no key)
+- Single Confirm button at bottom
 - Per-author tables are stable (index=ID); persistent frames for display
 - On submit, we read the editors' return DataFrames and commit
 - Summary updates ONLY after Confirm ALL
@@ -37,6 +37,11 @@ def auto_detect_column(columns: List[str], possible_names: List[str]) -> Optiona
         if p.lower() in lower:
             return lower[p.lower()]
     return None
+
+def _zwsp_salt(key: str) -> str:
+    """Invisible suffix so expander labels are unique without visible clutter."""
+    count = (abs(hash(key)) % 3) + 1
+    return "\u200b" * count  # zero-width space(s)
 
 # ---------- Cached API calls ----------
 
@@ -146,7 +151,7 @@ def process_author_file(df: pd.DataFrame, surname_col: str, name_col: str, orcid
 
         candidates = fetch_author_candidates(first_name=name, last_name=surname, orcid=orcid)
         st.session_state.author_candidates[key] = {
-            "input_name": f"{surname}, {name}",
+            "input_name_file_order": f"{name}, {surname}",  # for UI (your requested format)
             "surname": surname,
             "name": name,
             "orcid": orcid,
@@ -173,17 +178,16 @@ def display_author_candidates():
 
     # ---- BIG FORM: ticking inside does NOT rerun ----
     with st.form("authors_selection_form", clear_on_submit=False):
-        # Top submit (unique label!)
-        submitted_top = st.form_submit_button(
-            "✅ Confirm ALL selections (top)", type="primary", use_container_width=False
-        )
-
         # Capture editors' return values per author
         form_edits: Dict[str, pd.DataFrame] = {}
 
-        for key, data in st.session_state.author_candidates.items():
-            # Add a tiny unique suffix to avoid any rare expander label collisions
-            label = f"📝 {data['input_name']} \u200b{key}"
+        # Sort authors A→Z by name, then surname
+        for key, data in sorted(
+            st.session_state.author_candidates.items(),
+            key=lambda kv: (kv[1]["name"].lower(), kv[1]["surname"].lower())
+        ):
+            # Add invisible salt so labels are unique (not shown)
+            label = f"📝 {data['input_name_file_order']}{_zwsp_salt(key)}"
             with st.expander(label, expanded=False):
                 cands = data["candidates"]
                 if not cands:
@@ -207,12 +211,8 @@ def display_author_candidates():
                 # Store the returned DataFrame (real pandas object)
                 form_edits[key] = edited_df
 
-        # Bottom submit (unique label!)
-        submitted_bottom = st.form_submit_button(
-            "✅ Confirm ALL selections (bottom)", type="primary", use_container_width=False
-        )
-
-    submitted = submitted_top or submitted_bottom
+        # Single bottom submit
+        submitted = st.form_submit_button("✅ Confirm ALL selections", type="primary")
 
     if submitted:
         commit_all_selected_authors(form_edits)
@@ -230,9 +230,9 @@ def show_committed_summary():
 
     c1, c2 = st.columns(2)
     with c1:
-        st.metric("Committed author profiles", committed_profiles)
+        st.metric("Total matching profiles selected", committed_profiles)
     with c2:
-        st.metric("Sum of publications (committed)", committed_works)
+        st.metric("Total corresponding publications", committed_works)
 
 # ---------- Commit / Prefill helpers ----------
 
