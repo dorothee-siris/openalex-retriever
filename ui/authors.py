@@ -1,10 +1,11 @@
 # ui/authors.py
-"""Author selection UI for OpenAlex retriever (enhanced)
+"""Author selection UI for OpenAlex retriever (enhanced, stable selections)
 - Cap upload at 10 MB
 - Global confirm (top and bottom), no per-author confirm
 - Single Expand/Collapse all toggle (robust)
 - Show number of names to review
-- Compact summary of selected profiles & total works at the end
+- Compact summary of selected profiles & total works
+- Stable row identity in st.data_editor using ID as index (prevents auto-unselect)
 """
 
 from typing import Optional, List, Dict
@@ -225,46 +226,49 @@ def display_author_candidates():
                 st.warning("No matches found.")
                 continue
 
+            # Build display with STABLE row identity: set index to 'ID'
             table_rows = []
             for c in cands:
                 table_rows.append({
-                    "Select": c["id"] in data.get("selected", []),
                     "Name": c.get("display_name", ""),
                     "ID": c.get("id", ""),
                     "ORCID": c.get("orcid", ""),
                     "Publications": c.get("works_count", 0),
                     "Affiliations": ", ".join(c.get("affiliations", [])[:2]),
                     "Topics": ", ".join(c.get("topics", [])[:3]),
+                    "Select": c["id"] in data.get("selected", []),  # selection comes from session
                 })
 
-            df_display = pd.DataFrame(table_rows)
+            df_display = pd.DataFrame(table_rows).set_index("ID")  # << stable row keys
 
             edited = st.data_editor(
                 df_display,
                 hide_index=True,
                 use_container_width=True,
+                num_rows="fixed",
                 column_config={
                     "Select": st.column_config.CheckboxColumn("Select", help="Check to include this profile"),
-                    "ID": st.column_config.TextColumn("OpenAlex ID", width="medium"),
                     "Publications": st.column_config.NumberColumn("Publications", format="%d"),
                 },
-                disabled=["Name", "ID", "ORCID", "Publications", "Affiliations", "Topics"],
+                # Note: 'ID' is now the index; don't list it in disabled columns.
+                disabled=["Name", "ORCID", "Publications", "Affiliations", "Topics"],
                 key=f"editor_{key}",
             )
 
-            # Persist selection (no per-author confirm)
-            st.session_state.author_candidates[key]["selected"] = edited[edited["Select"]]["ID"].tolist()
+            # Persist selection (no per-author confirm). 'edited' keeps our row index (ID)
+            selected_ids = [idx for idx, val in edited["Select"].items() if bool(val)]
+            st.session_state.author_candidates[key]["selected"] = selected_ids
 
     # --- Compact summary + bottom global confirm ---
-    selected_ids = []
+    selected_ids_all = []
     id_to_works = {}
     for data in st.session_state.author_candidates.values():
         for c in data["candidates"]:
             id_to_works[c["id"]] = c.get("works_count", 0)
-        selected_ids.extend(data.get("selected", []))
+        selected_ids_all.extend(data.get("selected", []))
 
-    selected_profiles = len(selected_ids)
-    total_works = sum(id_to_works.get(_id, 0) for _id in selected_ids)
+    selected_profiles = len(selected_ids_all)
+    total_works = sum(id_to_works.get(_id, 0) for _id in selected_ids_all)
 
     st.divider()
     c1, c2 = st.columns(2)
