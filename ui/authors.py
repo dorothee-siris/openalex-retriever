@@ -287,11 +287,10 @@ def commit_all_selected_authors(form_edits: Dict[str, pd.DataFrame]):
             st.session_state.selected_entities.append({
                 "type": "author",
                 "id": sid,
-                # keep your UI label if you like
                 "label": f"{data['surname'].upper()} {data['name']} → {cand.get('display_name', '')}",
-                # <-- NEW: the exact name from your file for output columns
-                "file_label": f"{data['surname']}, {data['name']}",
-                # also stash components if ever needed again
+                # use Name, Surname from the uploaded file for output columns
+                "file_label": f"{data['name']}, {data['surname']}",
+                # keep parts handy if ever needed
                 "metadata": {**cand, "input_key": key, "file_surname": data["surname"], "file_name": data["name"]},
             })
 

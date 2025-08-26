@@ -246,6 +246,7 @@ def retrieve_publications():
     # Get configuration
     config = st.session_state.config
     entities = st.session_state.selected_entities
+    entity_label = "institutions" if st.session_state.selection_mode == "institutions" else "profiles"
     
     # Validate configuration
     if config['start_year'] > config['end_year']:
@@ -263,6 +264,27 @@ def retrieve_publications():
     timer_placeholder = st.empty()
     
     all_publications = []
+    
+    # live counters
+    total_pubs = 0
+    success_calls = 0
+    failed_calls = 0
+
+    pubs_placeholder = st.empty()   # dynamic publications fetched so far
+    calls_placeholder = st.empty()  # dynamic API call stats
+
+    def on_page(add_count: int):
+        nonlocal total_pubs
+        total_pubs += int(add_count or 0)
+        pubs_placeholder.info(f"📄 Publications fetched so far: {total_pubs:,}")
+
+    def on_request(ok: bool):
+        nonlocal success_calls, failed_calls
+        if ok:
+            success_calls += 1
+        else:
+            failed_calls += 1
+        calls_placeholder.info(f"🔌 API calls — ✓ {success_calls} · ✗ {failed_calls}")
     
     # Process each entity
     for i, entity in enumerate(entities):
@@ -287,13 +309,15 @@ def retrieve_publications():
         entity_pubs = fetch_publications_parallel(
             session,
             entity['id'],
-            name_for_output,
+            name_for_output,           # <-- "Name, Surname" for authors
             entity['type'],
             config['start_year'],
             config['end_year'],
             config['doc_types'],
             config['metadata'],
-            lang_filter
+            lang_filter,
+            page_callback=on_page,           # <-- new
+            request_callback=on_request      # <-- new
         )
         
         all_publications.extend(entity_pubs)
@@ -301,10 +325,10 @@ def retrieve_publications():
         # Update metrics
         metrics_placeholder.metric(
             label="Progress",
-            value=f"{i+1}/{len(entities)} entities",
-            delta=f"{len(all_publications)} publications fetched"
+            value=f"{i+1}/{len(entities)} {entity_label}",
+            delta=f"{len(all_publications)} publications fetched (pre-dedup)"
         )
-        
+                
         # Memory management
         if len(all_publications) > 10000 and i % 3 == 0:
             gc.collect()
@@ -354,6 +378,17 @@ def retrieve_publications():
         # Calculate total time
         total_time = time.time() - start_time
         timer_placeholder.success(f"✅ Total processing time: {str(timedelta(seconds=int(total_time)))}")
+
+        with st.container():
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Time Elapsed", str(timedelta(seconds=int(total_time))))
+            with col2:
+                st.metric("Publications retrieved", f"{len(merged_publications):,}")
+            with col3:
+                st.metric("API calls (success)", f"{success_calls:,}")
+            with col4:
+                st.metric("API calls (failed)", f"{failed_calls:,}")
         
         # Save output
         if config['output_format'] == "CSV":
