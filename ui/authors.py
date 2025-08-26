@@ -1,5 +1,11 @@
 # ui/authors.py
-"""Author selection UI for OpenAlex retriever"""
+"""Author selection UI for OpenAlex retriever (enhanced)
+- Cap upload at 10 MB
+- Global confirm (top and bottom), no per-author confirm
+- Expand/Collapse all author panels
+- Show number of names to review
+- Compact summary of selected profiles & total works at the end
+"""
 
 from typing import Optional, List, Dict
 
@@ -7,18 +13,17 @@ import pandas as pd
 import streamlit as st
 
 from core.api_client import (
-    get_session,                # factory for requests.Session
+    get_session,                # requests.Session factory
     search_author_by_name,
     search_author_by_orcid,
     get_author_details,
 )
 
-
-# --------- CACHED RESOURCES / HELPERS ---------
+# ---------- Cached resources / helpers ----------
 
 @st.cache_resource
 def get_http_session():
-    """One shared HTTP session for the whole app (safe for non-serializable objects)."""
+    """One shared HTTP session for the whole app (resource, not data)."""
     return get_session()
 
 
@@ -36,7 +41,7 @@ def auto_detect_column(columns: List[str], possible_names: List[str]) -> Optiona
     return None
 
 
-# --------- CACHED DATA CALLS ---------
+# ---------- Cached data calls ----------
 
 @st.cache_data(ttl=300)
 def fetch_author_candidates(first_name: str, last_name: str, orcid: Optional[str] = None) -> List[Dict]:
@@ -48,7 +53,7 @@ def fetch_author_candidates(first_name: str, last_name: str, orcid: Optional[str
     candidates: List[Dict] = []
     seen_ids: set = set()
 
-    # If ORCID present, search it — but DO NOT stop; we still search by name to catch extra IDs.
+    # If ORCID present, search it — but DO NOT stop; also search by name to catch extra IDs.
     if orcid and str(orcid).strip().lower() not in {"", "nan", "none"}:
         for match in search_author_by_orcid(session, str(orcid).strip()):
             author_id = (match.get("id", "") or "").replace("https://openalex.org/", "")
@@ -58,7 +63,7 @@ def fetch_author_candidates(first_name: str, last_name: str, orcid: Optional[str
                     candidates.append(extract_author_info(details))
                     seen_ids.add(author_id)
 
-    # Always search by name as well (limit top 10 to keep UI snappy)
+    # Always search by name as well (limit top 10 for responsiveness)
     for match in search_author_by_name(session, first_name, last_name)[:10]:
         author_id = (match.get("id", "") or "").replace("https://openalex.org/", "")
         if author_id and author_id not in seen_ids:
@@ -70,11 +75,15 @@ def fetch_author_candidates(first_name: str, last_name: str, orcid: Optional[str
     return candidates
 
 
-# --------- RENDER FUNCTIONS ---------
+# ---------- Render functions ----------
 
 def render_author_selector():
     """Phase 1 — Author selection workflow."""
     st.header("1️⃣ Select Authors")
+
+    # Init UI state
+    st.session_state.setdefault("author_candidates", {})
+    st.session_state.setdefault("expand_all_authors", False)
 
     uploaded_file = st.file_uploader(
         "Upload Excel file with author names",
@@ -83,6 +92,11 @@ def render_author_selector():
     )
 
     if uploaded_file is not None:
+        # 🚦 Hard cap at 10 MB
+        if getattr(uploaded_file, "size", 0) > 10 * 1024 * 1024:
+            st.error("The file is larger than 10 MB. Please upload a smaller file.")
+            return
+
         try:
             df = pd.read_excel(uploaded_file)
         except Exception as e:
@@ -95,16 +109,18 @@ def render_author_selector():
 
         col1, col2, col3 = st.columns(3)
         with col1:
+            surname_col_guess = auto_detect_column(columns, ["surname", "last_name", "family_name"])
             surname_col = st.selectbox(
                 "Surname column",
                 options=columns,
-                index=columns.index(auto_detect_column(columns, ["surname", "last_name", "family_name"])) if auto_detect_column(columns, ["surname", "last_name", "family_name"]) else 0,
+                index=columns.index(surname_col_guess) if surname_col_guess else 0,
             )
         with col2:
+            name_col_guess = auto_detect_column(columns, ["name", "first_name", "given_name", "firstname"])
             name_col = st.selectbox(
                 "Name column",
                 options=columns,
-                index=columns.index(auto_detect_column(columns, ["name", "first_name", "given_name", "firstname"])) if auto_detect_column(columns, ["name", "first_name", "given_name", "firstname"]) else 0,
+                index=columns.index(name_col_guess) if name_col_guess else 0,
             )
         with col3:
             orcid_guess = auto_detect_column(columns, ["orcid", "orcid_id"])
@@ -120,11 +136,9 @@ def render_author_selector():
         if st.button("🔍 Search for Authors", type="primary"):
             process_author_file(df, surname_col, name_col, orcid_col)
 
+        # Only show candidates after processing
         if st.session_state.get("author_candidates"):
             display_author_candidates()
-
-    # Summary of selected author IDs (if any)
-    display_selected_authors_summary()
 
 
 def process_author_file(df: pd.DataFrame, surname_col: str, name_col: str, orcid_col: Optional[str]):
@@ -132,7 +146,8 @@ def process_author_file(df: pd.DataFrame, surname_col: str, name_col: str, orcid
     progress = st.progress(0)
     status = st.empty()
 
-    st.session_state.setdefault("author_candidates", {})
+    # reset previous run’s candidates (keep selections list intact until confirm)
+    st.session_state.author_candidates = {}
 
     total = len(df)
     for idx, row in df.iterrows():
@@ -154,7 +169,7 @@ def process_author_file(df: pd.DataFrame, surname_col: str, name_col: str, orcid
             "name": name,
             "orcid": orcid,
             "candidates": candidates,
-            "selected": [],
+            "selected": [],   # list of selected OpenAlex IDs for this person
         }
 
     status.success(f"✅ Found candidates for {len(st.session_state.author_candidates)} authors")
@@ -162,21 +177,42 @@ def process_author_file(df: pd.DataFrame, surname_col: str, name_col: str, orcid
 
 
 def display_author_candidates():
-    """Show candidate tables and allow multi-selection per uploaded person."""
+    """Show candidate tables and allow multi-selection per uploaded person (global confirm)."""
     st.subheader("Select OpenAlex Profiles for Each Author")
-    st.info("💡 You can select multiple profiles if the same person has several OpenAlex IDs.")
 
-    # Quick helper: auto-select best per author (max works_count)
-    if st.button("⚡ Auto-select best match for each author"):
-        for key, data in st.session_state.author_candidates.items():
-            if data["candidates"]:
-                best = max(data["candidates"], key=lambda x: x.get("works_count", 0))
-                data["selected"] = [best["id"]]
-        st.success("Auto-selected best matches.")
-        st.rerun()
+    total_names = len(st.session_state.author_candidates)
+    st.info(f"🧾 Names to review: **{total_names}**")
 
+    # Top actions row (auto-select, global confirm, expand/collapse)
+    c1, c2, c3, c4 = st.columns([1.6, 1.8, 1.2, 1.2])
+    with c1:
+        if st.button("⚡ Auto-select best match for each author"):
+            for key, data in st.session_state.author_candidates.items():
+                if data["candidates"]:
+                    best = max(data["candidates"], key=lambda x: x.get("works_count", 0))
+                    data["selected"] = [best["id"]]
+            st.success("Auto-selected best matches.")
+            st.rerun()
+
+    with c2:
+        if st.button("✅ Confirm ALL selections (add to list)"):
+            commit_all_selected_authors()
+            st.success("All selections confirmed.")
+            st.rerun()
+
+    with c3:
+        if st.button("▾ Expand all"):
+            st.session_state.expand_all_authors = True
+            st.rerun()
+
+    with c4:
+        if st.button("▸ Collapse all"):
+            st.session_state.expand_all_authors = False
+            st.rerun()
+
+    # Per-author panels
     for key, data in st.session_state.author_candidates.items():
-        with st.expander(f"📝 {data['input_name']}", expanded=False):
+        with st.expander(f"📝 {data['input_name']}", expanded=st.session_state.expand_all_authors):
             cands = data["candidates"]
             if not cands:
                 st.warning("No matches found.")
@@ -209,73 +245,68 @@ def display_author_candidates():
                 key=f"editor_{key}",
             )
 
-            # Persist selection
+            # Persist selection (no per-author confirm)
             st.session_state.author_candidates[key]["selected"] = edited[edited["Select"]]["ID"].tolist()
 
-            # Confirm button for this author
-            if st.button("✅ Confirm selection", key=f"confirm_{key}"):
-                update_selected_entities_for_author(key)
-                st.success("Selection confirmed.")
+    # --- Compact summary + bottom global confirm ---
+    selected_ids = []
+    id_to_works = {}
+    for data in st.session_state.author_candidates.values():
+        for c in data["candidates"]:
+            id_to_works[c["id"]] = c.get("works_count", 0)
+        selected_ids.extend(data.get("selected", []))
 
-
-def update_selected_entities_for_author(author_key: str):
-    """Replace any previous selections for this uploaded person with the current ones."""
-    data = st.session_state.author_candidates[author_key]
-    surname = data["surname"]
-    name = data["name"]
-    selected_ids = set(data.get("selected", []))
-
-    # Remove older entries for this author_key
-    st.session_state.selected_entities = [
-        e for e in st.session_state.selected_entities
-        if not (e.get("type") == "author" and e.get("metadata", {}).get("input_key") == author_key)
-    ]
-
-    # Add current selections
-    for cand_id in selected_ids:
-        cand = next((c for c in data["candidates"] if c["id"] == cand_id), None)
-        if not cand:
-            continue
-        st.session_state.selected_entities.append({
-            "type": "author",
-            "id": cand_id,
-            "label": f"{surname.upper()} {name} → {cand.get('display_name', '')}",
-            "metadata": {**cand, "input_key": author_key},
-        })
-
-
-def display_selected_authors_summary():
-    """Compact list of selected author profiles (across all uploaded rows)."""
-    author_entities = [e for e in st.session_state.get("selected_entities", []) if e.get("type") == "author"]
-    if not author_entities:
-        return
+    selected_profiles = len(selected_ids)
+    total_works = sum(id_to_works.get(_id, 0) for _id in selected_ids)
 
     st.divider()
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.subheader(f"📋 Selected Author Profiles ({len(author_entities)})")
-    with col2:
-        if st.button("🗑️ Clear All"):
-            st.session_state.selected_entities = [e for e in st.session_state.selected_entities if e.get("type") != "author"]
-            st.rerun()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Selected author profiles", selected_profiles)
+    with c2:
+        st.metric("Sum of publications across selected profiles", total_works)
 
-    for ent in author_entities:
-        c1, c2 = st.columns([11, 1])
-        with c1:
-            st.write(f"• {ent['label']}")
-        with c2:
-            if st.button("❌", key=f"remove_auth_{ent['id']}"):
-                st.session_state.selected_entities.remove(ent)
-                st.rerun()
+    if st.button("✅ Confirm ALL selections (add to list)", key="confirm_all_bottom"):
+        commit_all_selected_authors()
+        st.success("All selections confirmed.")
+        st.rerun()
 
 
-# --------- DATA EXTRACTION UTILS ---------
+# ---------- Commit helpers ----------
+
+def commit_all_selected_authors():
+    """Commit ALL current selections to st.session_state.selected_entities."""
+    if "author_candidates" not in st.session_state:
+        return
+
+    # Remove previous selections for any of the currently uploaded names
+    input_keys = set(st.session_state.author_candidates.keys())
+    st.session_state.setdefault("selected_entities", [])
+    st.session_state.selected_entities = [
+        e for e in st.session_state.selected_entities
+        if not (e.get("type") == "author" and e.get("metadata", {}).get("input_key") in input_keys)
+    ]
+
+    # Add new selections
+    for key, data in st.session_state.author_candidates.items():
+        surname = data["surname"]
+        name = data["name"]
+        for sid in data.get("selected", []):
+            cand = next((c for c in data["candidates"] if c["id"] == sid), None)
+            if not cand:
+                continue
+            st.session_state.selected_entities.append({
+                "type": "author",
+                "id": sid,
+                "label": f"{surname.upper()} {name} → {cand.get('display_name', '')}",
+                "metadata": {**cand, "input_key": key},
+            })
+
+
+# ---------- Data extraction utils ----------
 
 def extract_author_info(author_data: Dict) -> Dict:
-    """
-    Normalize author detail payload into a compact dict for UI selection.
-    Works for /people/{id} responses.
-    """
+    """Normalize author detail payload into a compact dict for UI selection."""
     affiliations: List[str] = []
 
     # affiliations (historical)
