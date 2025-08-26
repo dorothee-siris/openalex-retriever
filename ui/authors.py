@@ -2,7 +2,7 @@
 """Author selection UI for OpenAlex retriever (form-based, no flicker, safe submit)
 - 10 MB upload cap
 - One big form: ticking checkboxes does NOT rerun the app
-- Two global Confirm buttons (top and bottom) with unique keys
+- Two global Confirm buttons (top and bottom) with unique labels (no key)
 - Per-author tables are stable (index=ID); persistent frames for display
 - On submit, we read the editors' return DataFrames and commit
 - Summary updates ONLY after Confirm ALL
@@ -173,16 +173,16 @@ def display_author_candidates():
 
     # ---- BIG FORM: ticking inside does NOT rerun ----
     with st.form("authors_selection_form", clear_on_submit=False):
-        # Top submit (unique key!)
+        # Top submit (unique label!)
         submitted_top = st.form_submit_button(
-            "✅ Confirm ALL selections (add to list)", type="primary", use_container_width=False, key="submit_top_authors"
+            "✅ Confirm ALL selections (top)", type="primary", use_container_width=False
         )
 
         # Capture editors' return values per author
         form_edits: Dict[str, pd.DataFrame] = {}
 
         for key, data in st.session_state.author_candidates.items():
-            # To reduce chance of duplicate expander IDs if names repeat, add a tiny unique suffix
+            # Add a tiny unique suffix to avoid any rare expander label collisions
             label = f"📝 {data['input_name']} \u200b{key}"
             with st.expander(label, expanded=False):
                 cands = data["candidates"]
@@ -207,9 +207,9 @@ def display_author_candidates():
                 # Store the returned DataFrame (real pandas object)
                 form_edits[key] = edited_df
 
-        # Bottom submit (unique key!)
+        # Bottom submit (unique label!)
         submitted_bottom = st.form_submit_button(
-            "✅ Confirm ALL selections (add to list)", type="primary", use_container_width=False, key="submit_bottom_authors"
+            "✅ Confirm ALL selections (bottom)", type="primary", use_container_width=False
         )
 
     submitted = submitted_top or submitted_bottom
