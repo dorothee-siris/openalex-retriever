@@ -44,12 +44,11 @@ def show_landing_page():
             <div style='{card_style}'>
                 <h2>👤 By Authors</h2>
                 <p style="margin-bottom:6px;">
-                  Upload an Excel list of names to retrieve their publications
-                  (you can select multiple OpenAlex profiles per person).
+                  Upload an Excel list of names to retrieve their publications.
                 </p>
                 <p style="margin: 10px 0 6px 0;"><b>Best for:</b></p>
                 <ul style="margin: 0 0 6px 18px;">
-                  <li>Analysing <b>non-institutional perimeters</b> — transversal initiatives, institutes, teams, networks</li>
+                  <li>Analysing <b>non-institutional perimeters</b> — transversal initiatives, teams, networks</li>
                   <li>Measuring an organisation’s <b>true research footprint</b> via its people
                       (reduces affiliation biases: wrong/lagging affiliations, retirees, etc.)</li>
                 </ul>
