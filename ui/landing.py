@@ -13,7 +13,7 @@ def show_landing_page():
         <div style='text-align: center; padding: 20px; background-color: #f0f2f6; border-radius: 10px; min-height: 200px;'>
             <h2>🏛️ By Institutions</h2>
             <p>Search and select institutions to retrieve all publications affiliated with them.</p>
-            <p><b>Best for:</b> Institutional reports, department analysis, university rankings</p>
+            <p><b>Best for:</b> Recreate a dataset of a group of institutions registered in ROR, keeping track of their internal collaborations </p>
         </div>
         """, unsafe_allow_html=True)
         
@@ -29,7 +29,7 @@ def show_landing_page():
         <div style='text-align: center; padding: 20px; background-color: #f0f2f6; border-radius: 10px; min-height: 200px;'>
             <h2>👤 By Authors</h2>
             <p>Upload a list of author names to retrieve their publications.</p>
-            <p><b>Best for:</b> Team publications, researcher tracking, collaboration analysis</p>
+            <p><b>Best for:</b> Analyse the production of non-institutional perimeters (teams, transversal initiatives...), keeping track of internal collaborations </p>
         </div>
         """, unsafe_allow_html=True)
         
