@@ -251,8 +251,20 @@ def render_author_selector():
 def display_author_candidates():
     st.subheader("Select OpenAlex Profiles for Each Author")
 
+    # NEW: totals and "no match" feedback
     total_names = len(st.session_state.author_candidates)
-    st.info(f"🧾 Names to review: **{total_names}**")
+    unmatched = [
+        data["input_name_file_order"]
+        for data in st.session_state.author_candidates.values()
+        if not data.get("candidates")
+    ]
+    st.info(f"🧾 Names to review: **{total_names}**  •  No match: **{len(unmatched)}**")
+
+    if unmatched:
+        with st.expander(f"Show authors with no matches ({len(unmatched)})", expanded=False):
+            # bullet list for readability
+            for nm in sorted(unmatched, key=lambda s: s.lower()):
+                st.markdown(f"- {nm}")
 
     # Optional prefill (best match by works_count)
     if st.button("⚡ Prefill best match for each author (optional)"):
@@ -292,7 +304,10 @@ def display_author_candidates():
                         "Select": st.column_config.CheckboxColumn("Select", help="Tick to choose this profile"),
                         "Publications": st.column_config.NumberColumn("Publications", format="%d"),
                     },
-                    disabled=["Name", "ORCID", "Publications", "Affiliations 2025", "Last known institutions", "Topics"],
+                    disabled=[
+                        "Name", "ORCID", "Publications",
+                        "Affiliations 2025", "Last known institutions", "Topics"
+                    ],
                     key=f"editor_{key}",
                 )
                 form_edits[key] = edited_df
