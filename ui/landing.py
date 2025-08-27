@@ -1,11 +1,70 @@
 # ui/landing.py
-"""Landing page for method selection with dedup/collaboration note and stronger use-cases."""
+"""Landing page for method selection with equal-sized cards and output note below."""
 import streamlit as st
 
 def show_landing_page():
-    """Display the landing page with method selection"""
+    st.markdown("### Choose Your Retrieval Method")
+    st.markdown("Select how you want to retrieve publications from OpenAlex:")
 
-    # ——— Output behavior banner ———
+    col1, col2 = st.columns(2)
+
+    # Common card style to keep same visual size
+    card_style = (
+        "text-align: left; padding: 20px; background-color: #f0f2f6; "
+        "border-radius: 10px; min-height: 260px; display:flex; flex-direction:column; justify-content:flex-start;"
+    )
+
+    with col1:
+        st.markdown(
+            f"""
+            <div style='{card_style}'>
+                <h2>🏛️ By Institutions</h2>
+                <p style="margin-bottom:6px;">
+                  Search and select institutions to retrieve all publications affiliated with them.
+                </p>
+                <p style="margin: 10px 0 6px 0;"><b>Best for:</b></p>
+                <ul style="margin: 0 0 6px 18px;">
+                  <li>Rebuilding a <b>disambiguated dataset</b> for a lab/faculty/department (using ROR sub-orgs)</li>
+                  <li>Studying <b>intra-group collaboration</b> between units of a university/federation</li>
+                  <li>Downloading a clean dataset for a <b>small consortium/facility cluster</b> with known ROR IDs</li>
+                </ul>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("")  # spacer
+        if st.button("Select Institutions", key="inst_btn", use_container_width=True, type="primary"):
+            st.session_state.selection_mode = "institutions"
+            st.session_state.selected_entities = []
+            st.rerun()
+
+    with col2:
+        st.markdown(
+            f"""
+            <div style='{card_style}'>
+                <h2>👤 By Authors</h2>
+                <p style="margin-bottom:6px;">
+                  Upload an Excel list of names to retrieve their publications
+                  (you can select multiple OpenAlex profiles per person).
+                </p>
+                <p style="margin: 10px 0 6px 0;"><b>Best for:</b></p>
+                <ul style="margin: 0 0 6px 18px;">
+                  <li>Analysing <b>non-institutional perimeters</b> — transversal initiatives, institutes, teams, networks</li>
+                  <li>Measuring an organisation’s <b>true research footprint</b> via its people
+                      (reduces affiliation biases: wrong/lagging affiliations, retirees, etc.)</li>
+                </ul>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("")  # spacer
+        if st.button("Select Authors", key="auth_btn", use_container_width=True, type="primary"):
+            st.session_state.selection_mode = "authors"
+            st.session_state.selected_entities = []
+            st.rerun()
+
+    # --- Output behavior banner (after the choice) ---
+    st.markdown("")
     st.markdown(
         """
         <div style="
@@ -23,75 +82,9 @@ def show_landing_page():
             <li><b>Authors Extracted</b> — all selected authors present on that work (and their <b>Author Position</b>)</li>
           </ul>
           <p style="margin: 6px 0 0 0;">
-            This makes it easy to read <b>collaborations inside your selection</b> (co-authorship across units/people)
-            without duplicates inflating counts.
+            This makes it easy to read <b>collaborations inside your selection</b> without duplicates inflating counts.
           </p>
         </div>
         """,
         unsafe_allow_html=True,
     )
-
-    st.markdown("")  # spacer
-
-    st.markdown("### Choose Your Retrieval Method")
-    st.markdown("Select how you want to retrieve publications from OpenAlex:")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown(
-            """
-            <div style='text-align: left; padding: 20px; background-color: #f0f2f6; border-radius: 10px; min-height: 260px;'>
-                <h2>🏛️ By Institutions</h2>
-                <p style="margin-bottom:6px;">
-                  Search and select institutions to retrieve all publications affiliated with them.
-                </p>
-                <p style="margin-bottom:6px;">
-                  <b>Requirement:</b> institutions must exist in <b>ROR</b>/OpenAlex (the selector uses your local ROR/OpenAlex parquet).
-                </p>
-                <p style="margin: 10px 0 6px 0;"><b>Best for:</b></p>
-                <ul style="margin: 0 0 6px 18px;">
-                  <li>Rebuilding a <b>disambiguated dataset</b> for a lab/faculty/department (using its ROR sub-orgs)</li>
-                  <li>Studying <b>intra-group collaboration</b> between units of a university/federation</li>
-                  <li>Downloading a clean dataset for a <b>small consortium/facility cluster</b> with known ROR IDs</li>
-                </ul>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.markdown("")  # spacer
-
-        if st.button("Select Institutions", key="inst_btn", use_container_width=True, type="primary"):
-            st.session_state.selection_mode = "institutions"
-            st.session_state.selected_entities = []
-            st.rerun()
-
-    with col2:
-        st.markdown(
-            """
-            <div style='text-align: left; padding: 20px; background-color: #f0f2f6; border-radius: 10px; min-height: 260px;'>
-                <h2>👤 By Authors</h2>
-                <p style="margin-bottom:6px;">
-                  Upload an Excel list of names to retrieve their publications (multiple OpenAlex profiles per person can be selected).
-                </p>
-                <p style="margin-bottom:6px;">
-                  The output keeps your <b>uploaded name format</b> (“Name, Surname”) in the “Authors Extracted” column.
-                </p>
-                <p style="margin: 10px 0 6px 0;"><b>Best for:</b></p>
-                <ul style="margin: 0 0 6px 18px;">
-                  <li>Analysing <b>non-institutional perimeters</b> — transversal initiatives, institutes, teams, networks</li>
-                  <li>Measuring an organisation’s <b>real research footprint</b> via its people
-                      (avoids affiliation biases like wrong/lagging affiliations or retirees)</li>
-                </ul>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.markdown("")  # spacer
-
-        if st.button("Select Authors", key="auth_btn", use_container_width=True, type="primary"):
-            st.session_state.selection_mode = "authors"
-            st.session_state.selected_entities = []
-            st.rerun()
