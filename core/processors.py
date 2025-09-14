@@ -6,7 +6,7 @@ import pandas as pd
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .api_client import MAX_WORKERS
+from .api_client import MAX_WORKERS, MAILTO, fetch_works_cursor_page  # changed import
 from .formatters import (
     OPENALEX_PATTERN,
     DOI_PATTERN,
@@ -202,51 +202,32 @@ def fetch_single_doc_type(
     - page_callback(int_added) is called after each page to increment the UI counter
     - request_callback(ok: bool) is called after each HTTP attempt
     """
-    from .api_client import MAILTO, fetch_works_page
-
+    
     filter_str = f"{base_filter_str},type:{doc_type}" if doc_type else base_filter_str
-    params = {
-        "filter": filter_str,
-        "per_page": 50,
-        "mailto": MAILTO,
-    }
+    params = {"filter": filter_str, "per_page": 200, "mailto": MAILTO}
 
-    publications: List[Dict] = []
-
-    # First page
-    results, total_count, success = fetch_works_page(session, url, params)
-    if request_callback:
-        request_callback(bool(success))
-    if not success:
-        return publications
-
-    if page_callback:
-        page_callback(len(results))
-
-    publications.extend(
-        process_publications_batch(results, entity_id, entity_name, entity_type, selected_metadata)
-    )
-
-    per_page = 50
-    total_pages = min((total_count + per_page - 1) // per_page, 200)
-
-    # Remaining pages
-    for page in range(2, total_pages + 1):
-        params["page"] = page
-        results, _, success = fetch_works_page(session, url, params)
+    publications = []
+    cursor = None
+    while True:
+        results, next_cursor, success = fetch_works_cursor_page(session, url, params, cursor)
 
         if request_callback:
             request_callback(bool(success))
+        if not success:
+            break
 
-        if success:
+        if results:
             if page_callback:
                 page_callback(len(results))
             publications.extend(
                 process_publications_batch(results, entity_id, entity_name, entity_type, selected_metadata)
             )
+            if len(publications) % 5000 == 0:
+                gc.collect()
 
-        if len(publications) % 5000 == 0:
-            gc.collect()
+        if not next_cursor:
+            break
+        cursor = next_cursor
 
     return publications
 

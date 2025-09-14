@@ -1,134 +1,112 @@
 # core/api_client.py
-"""OpenAlex API client functions (polite, thread-safe rate limiting; no ORCID lookups)."""
+"""
+API client utilities for OpenAlex.
+- Global token-bucket rate limiter (REQUESTS_PER_SECOND)
+- Shared requests.Session with connection pooling
+- Simple 429 backoff
+- Single polite-pool email (no rotation)
+"""
 
-from typing import Dict, List, Optional, Any, Tuple
-import threading
+from typing import Optional, Dict
 import requests
+import threading
 import time
-import random
 
-# -------------------- Constants --------------------
-
+# ---- Config knobs (tune here) ----
 MAILTO = "theodore.hervieux@sirisacademic.com"
+REQUESTS_PER_SECOND = 8          # global polite rate
+MAX_WORKERS = 10                 # threads for slices/doc_types per entity
+PARALLEL_ENTITIES = 5            # run up to N institutions/authors at once
 
-# Respectful pacing (global, across all threads)
-PUBLICATIONS_DELAY = 0.10   # works endpoints
-AUTHORS_DELAY = 0.20        # authors search
-RETRY_AFTER_429 = 2.0
 
-# Parallelism (used elsewhere; keep as-is)
-MAX_WORKERS = 3             # for works fetching by doc type
-MAX_AUTHOR_WORKERS = 10     # suggested upper bound for author prefetch (optional)
+# ---- helpers ----
 
-# -------------------- Global rate limit state --------------------
+def search_author_by_name(session: requests.Session, first_name: str, last_name: str):
+    url = "https://api.openalex.org/authors"
+    params = {"search": f"{first_name} {last_name}", "per_page": 50}
+    r = rate_limited_get(session, url, params=params, timeout=30)
+    if not r or r.status_code != 200:
+        return []
+    try:
+        return (r.json() or {}).get("results", []) or []
+    except Exception:
+        return []
+    
+from typing import Tuple, List, Dict, Any, Optional
 
-_last_request_time: float = 0.0
-_rate_lock = threading.Lock()
 
-# -------------------- Session --------------------
+def fetch_works_cursor_page(
+    session: requests.Session, url: str, base_params: Dict[str, Any], cursor: Optional[str]
+) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+    # mailto is injected inside rate_limited_get
+    params = dict(base_params)
+    params.setdefault("per_page", 200)
+    params["cursor"] = cursor if cursor is not None else "*"
+
+    r = rate_limited_get(session, url, params=params, timeout=30)
+    if not r or r.status_code != 200:
+        return [], None, False
+    try:
+        data = r.json() or {}
+        results = data.get("results", []) or []
+        next_cursor = (data.get("meta") or {}).get("next_cursor")
+        return results, next_cursor, True
+    except Exception:
+        return [], None, False
+
+
+# ---- Token-bucket limiter ----
+class RateLimiter:
+    def __init__(self, rps: float):
+        self.rps = float(rps)
+        self.tokens = self.rps
+        self.last = time.time()
+        self.lock = threading.Lock()
+
+    def wait(self):
+        """Block until a token is available."""
+        while True:
+            with self.lock:
+                now = time.time()
+                dt = now - self.last
+                self.tokens = min(self.rps, self.tokens + dt * self.rps)
+                self.last = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                wait_s = (1.0 - self.tokens) / self.rps
+            time.sleep(wait_s)
+
+_limiter = RateLimiter(REQUESTS_PER_SECOND)
 
 def get_session() -> requests.Session:
-    """Create a requests session with connection pooling and a proper UA."""
+    """Shared session with connection pooling and retries."""
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": f"SIRIS Academic Research Tool/1.0 (mailto:{MAILTO})"
-    })
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=10,
-        pool_maxsize=10,
-        max_retries=3,
-    )
+    s.headers.update({"User-Agent": "SIRIS OpenAlex Retriever/1.0"})
+    adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=3)
     s.mount("http://", adapter)
     s.mount("https://", adapter)
     return s
 
-# -------------------- Core HTTP with polite throttling --------------------
+def rate_limited_get(session: requests.Session, url: str, params: Optional[Dict] = None, timeout=30) -> Optional[requests.Response]:
+    """Global-throttled GET with small retry/backoff on 429/network errors."""
+    if params is None:
+        params = {}
+    params["mailto"] = MAILTO
 
-def rate_limited_get(
-    session: requests.Session,
-    url: str,
-    params: Optional[Dict[str, Any]] = None,
-    *,
-    max_retries: int = 3,
-    delay: float = PUBLICATIONS_DELAY,
-) -> Optional[requests.Response]:
-    """Rate-limited GET with exponential backoff. Global lock enforces min delay across threads."""
-    global _last_request_time
-
-    retries = 0
-    backoff = RETRY_AFTER_429
-
-    while retries <= max_retries:
-        # throttle globally
-        with _rate_lock:
-            now = time.time()
-            elapsed = now - _last_request_time
-            if elapsed < delay:
-                time.sleep(delay - elapsed)
-            _last_request_time = time.time()
-
+    backoff = 2.0
+    for _ in range(5):  # up to 5 tries
+        _limiter.wait()
         try:
-            resp = session.get(url, params=params, timeout=30)
-        except requests.exceptions.RequestException:
-            retries += 1
-            if retries <= max_retries:
-                time.sleep(backoff)
-                backoff *= 2
+            r = session.get(url, params=params, timeout=timeout)
+        except requests.RequestException:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 16)
             continue
 
-        # OK
-        if resp.status_code == 200:
-            return resp
-
-        # Too many requests -> backoff and retry
-        if resp.status_code == 429:
-            retries += 1
-            if retries > max_retries:
-                return resp
-            # jittered backoff
-            wait = backoff * (0.5 + 0.5 * random.random())
-            time.sleep(wait)
-            backoff *= 2
+        if r.status_code == 429:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 16)
             continue
-
-        # Other non-200 -> return as-is (let caller decide)
-        return resp
-
+        return r
     return None
-
-# -------------------- Authors search (name only) --------------------
-
-def search_author_by_name(session: requests.Session, first_name: str, last_name: str) -> List[Dict[str, Any]]:
-    """Search authors by name. Returns raw /authors 'results' list (not /people)."""
-    url = "https://api.openalex.org/authors"
-    params = {
-        "search": f"{first_name} {last_name}",
-        "per_page": 50,          # pull a bigger page; caller can cap to 20
-        "mailto": MAILTO,
-    }
-    resp = rate_limited_get(session, url, params=params, delay=AUTHORS_DELAY)
-    if resp and resp.status_code == 200:
-        try:
-            data = resp.json()
-            return data.get("results", []) or []
-        except Exception:
-            return []
-    return []
-
-# -------------------- Works paging helper --------------------
-
-def fetch_works_page(session: requests.Session, url: str, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int, bool]:
-    """
-    Fetch one page from /works. Returns (results, total_count, success_flag).
-    Caller is responsible for setting 'per_page' and 'page' in params.
-    """
-    resp = rate_limited_get(session, url, params=params, delay=PUBLICATIONS_DELAY)
-    if not resp or resp.status_code != 200:
-        return [], 0, False
-    try:
-        data = resp.json()
-        results = data.get("results", []) or []
-        total = int(data.get("meta", {}).get("count", 0) or 0)
-        return results, total, True
-    except Exception:
-        return [], 0, False
