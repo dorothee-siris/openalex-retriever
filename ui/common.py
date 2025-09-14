@@ -3,7 +3,8 @@
 Shared UI (Streamlit) for configuration & retrieval.
 
 - Center-panel configuration with a FORM (freeze while adjusting)
-- Expert Mode (RPS, per-entity workers, parallel entities, per_page)
+- API parameters (experts only) section (always visible)
+- Select/Unselect all for Document types and Metadata (within the form)
 - Entity-level parallelism (in retrieve_publications)
 - Cursor pagination end-to-end; no year chunking
 - Phase 3 is gated by an explicit **Start retrieval** button
@@ -67,24 +68,21 @@ METADATA_FIELDS: Dict[str, str] = {
     "biblio.last_page": "Last Page",
 }
 
-DEFAULT_METADATA = [
-    "id", "doi", "display_name", "publication_year", "type",
-    "cited_by_count", "publication_date",
-]
+DEFAULT_METADATA = list(METADATA_FIELDS.keys())  # default: all selected
 
 
 def ensure_defaults():
     st.session_state.setdefault("selection_mode", "institutions")
     st.session_state.setdefault("selected_entities", [])
     st.session_state.setdefault("config", {
+        # Retrieval
         "start_year": CURRENT_YEAR - 5,
         "end_year": CURRENT_YEAR,
-        "doc_types": [],
-        "metadata": DEFAULT_METADATA.copy(),
-        "language_filter": "All Languages",  # or "English Only"
-        "output_format": "Parquet",          # or "CSV"
-        "expert_mode": False,
-        # expert knobs (only used when expert_mode True)
+        "doc_types": DOCUMENT_TYPES[:],          # UI default = all selected
+        "metadata": DEFAULT_METADATA[:],         # UI default = all selected
+        "language_filter": "All Languages",      # or "English Only"
+        "output_format": "Parquet",              # or "CSV"
+        # API params (experts only)
         "requests_per_second": 8.0,
         "max_workers": 10,
         "parallel_entities": PARALLEL_ENTITIES,
@@ -109,7 +107,6 @@ def render_config_section():
         "cfg_output": cfg["output_format"],
         "cfg_doc_types": cfg["doc_types"][:],
         "cfg_metadata": cfg["metadata"][:],
-        "cfg_expert": bool(cfg.get("expert_mode", False)),
         "cfg_rps": float(cfg.get("requests_per_second", 8.0)),
         "cfg_workers": int(cfg.get("max_workers", 10)),
         "cfg_parallel": int(cfg.get("parallel_entities", PARALLEL_ENTITIES)),
@@ -129,7 +126,18 @@ def render_config_section():
         with c4:
             st.radio("Output", ["Parquet", "CSV"], key="cfg_output", help="Parquet compresses better for large files")
 
-        st.subheader("Document Types")
+        # ---- Document types (with select/unselect all) ----
+        st.subheader("Document types")
+        dtop, dmid, dbot = st.columns([1, 2, 3])
+        with dtop:
+            sel_all_dt = st.checkbox("Select all", value=(len(st.session_state.cfg_doc_types) == len(DOCUMENT_TYPES)))
+        with dmid:
+            unsel_all_dt = st.checkbox("Unselect all", value=(len(st.session_state.cfg_doc_types) == 0))
+        if sel_all_dt and not unsel_all_dt:
+            st.session_state.cfg_doc_types = DOCUMENT_TYPES[:]
+        elif unsel_all_dt and not sel_all_dt:
+            st.session_state.cfg_doc_types = []
+
         doc_cols = st.columns(5)
         new_doc_types = []
         for i, dt in enumerate(DOCUMENT_TYPES):
@@ -138,37 +146,48 @@ def render_config_section():
                     new_doc_types.append(dt)
         st.session_state.cfg_doc_types = new_doc_types
 
-        st.subheader("Metadata Fields")
+        # ---- Metadata (with select/unselect all) ----
+        st.subheader("Metadata fields")
+        mtop, mmid, mbot = st.columns([1, 2, 3])
+        with mtop:
+            sel_all_md = st.checkbox("Select all", value=(set(st.session_state.cfg_metadata) == set(DEFAULT_METADATA)))
+        with mmid:
+            unsel_all_md = st.checkbox("Unselect all", value=(len(st.session_state.cfg_metadata) == 0))
+        if sel_all_md and not unsel_all_md:
+            st.session_state.cfg_metadata = DEFAULT_METADATA[:]
+        elif unsel_all_md and not sel_all_md:
+            st.session_state.cfg_metadata = []
+
         meta_cols = st.columns(3)
         new_meta = []
-        # Always include id
-        with meta_cols[0]:
-            st.checkbox(METADATA_FIELDS["id"], value=True, disabled=True, key="cfg_meta_id")
-            new_meta.append("id")
-        others = [k for k in METADATA_FIELDS.keys() if k != "id"]
-        for i, m in enumerate(others, start=1):
+        for i, m in enumerate(DEFAULT_METADATA):
             with meta_cols[i % 3]:
-                if st.checkbox(METADATA_FIELDS.get(m, m), value=(m in st.session_state.cfg_metadata), key=f"cfg_meta_{m}"):
+                # keep id checked if present in choices
+                default_on = (m in st.session_state.cfg_metadata) or (m == "id")
+                disabled = (m == "id")
+                if st.checkbox(METADATA_FIELDS.get(m, m), value=default_on, disabled=disabled, key=f"cfg_meta_{m}"):
                     new_meta.append(m)
+        # ensure id is always present
+        if "id" not in new_meta:
+            new_meta.insert(0, "id")
         st.session_state.cfg_metadata = new_meta
 
-        st.markdown("---")
-        st.checkbox("Activate expert mode", key="cfg_expert")
-        if st.session_state.cfg_expert:
-            e1, e2, e3, e4 = st.columns(4)
-            with e1:
-                st.slider("Requests per second", 1.0, 30.0, float(st.session_state.cfg_rps), 0.5, key="cfg_rps")
-            with e2:
-                st.slider("Max workers per entity", 1, 32, int(st.session_state.cfg_workers), key="cfg_workers")
-            with e3:
-                st.slider("Parallel entities", 1, 16, int(st.session_state.cfg_parallel), key="cfg_parallel")
-            with e4:
-                st.selectbox(
-                    "Results per page",
-                    [50, 100, 200],
-                    index=[50, 100, 200].index(int(st.session_state.cfg_per_page)),
-                    key="cfg_per_page",
-                )
+        # ---- API parameters (experts only) ----
+        st.subheader("API parameters (experts only)")
+        e1, e2, e3, e4 = st.columns(4)
+        with e1:
+            st.slider("Requests per second", 1.0, 30.0, float(st.session_state.cfg_rps), 0.5, key="cfg_rps")
+        with e2:
+            st.slider("Max workers per entity", 1, 32, int(st.session_state.cfg_workers), key="cfg_workers")
+        with e3:
+            st.slider("Parallel entities", 1, 16, int(st.session_state.cfg_parallel), key="cfg_parallel")
+        with e4:
+            st.selectbox(
+                "Results per page",
+                [50, 100, 200],
+                index=[50, 100, 200].index(int(st.session_state.cfg_per_page)),
+                key="cfg_per_page",
+            )
 
         applied = st.form_submit_button("Apply configuration", type="primary")
 
@@ -178,14 +197,18 @@ def render_config_section():
             st.error("Start year cannot be after end year.")
             return
 
+        # If user selected all doc types, store [] to mean "no filtering" (most efficient).
+        doc_types_to_store = st.session_state.cfg_doc_types[:]
+        if len(doc_types_to_store) == len(DOCUMENT_TYPES):
+            doc_types_to_store = []
+
         cfg.update({
             "start_year": int(st.session_state.cfg_start_year),
             "end_year": int(st.session_state.cfg_end_year),
             "language_filter": st.session_state.cfg_language,
             "output_format": st.session_state.cfg_output,
-            "doc_types": st.session_state.cfg_doc_types[:],
+            "doc_types": doc_types_to_store,
             "metadata": st.session_state.cfg_metadata[:],
-            "expert_mode": bool(st.session_state.cfg_expert),
             "requests_per_second": float(st.session_state.cfg_rps),
             "max_workers": int(st.session_state.cfg_workers),
             "parallel_entities": int(st.session_state.cfg_parallel),
@@ -215,11 +238,23 @@ def render_retrieval_section():
 
 # ---------------- Retrieval core ----------------
 
+def _safe_avg_works(e: Dict) -> float:
+    """Return a numeric avg_works_per_year or 0.0 if missing/invalid."""
+    try:
+        v = (e.get("metadata") or {}).get("avg_works_per_year")
+        if v is None:
+            return 0.0
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
 def _estimate_and_warn_if_large():
     if st.session_state.get("selection_mode") != "institutions":
         return
     entities = st.session_state.get("selected_entities") or []
-    total_avg_works = sum(e.get("metadata", {}).get("avg_works_per_year", 0) for e in entities)
+    if not entities:
+        return
+    total_avg_works = sum(_safe_avg_works(e) for e in entities)
     if total_avg_works <= 0:
         return
     cfg = st.session_state.config
@@ -245,16 +280,11 @@ def retrieve_publications():
         st.error("Start year cannot be after end year.")
         return
 
-    # Apply Expert Mode parameters at runtime
-    if cfg.get("expert_mode"):
-        set_rate_limit(cfg.get("requests_per_second", 8.0))
-        parallel_entities = cfg.get("parallel_entities", PARALLEL_ENTITIES)
-        per_page = cfg.get("per_page", 200)
-        max_workers = cfg.get("max_workers", None)
-    else:
-        parallel_entities = PARALLEL_ENTITIES
-        per_page = 200
-        max_workers = None
+    # Always apply API params from config
+    set_rate_limit(cfg.get("requests_per_second", 8.0))
+    parallel_entities = cfg.get("parallel_entities", PARALLEL_ENTITIES)
+    per_page = cfg.get("per_page", 200)
+    max_workers = cfg.get("max_workers", None)
 
     entity_label = "institutions" if st.session_state.get("selection_mode") == "institutions" else "profiles"
 
