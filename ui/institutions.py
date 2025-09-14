@@ -1,194 +1,255 @@
 # ui/institutions.py
-"""Institution selection UI (no selection cap, with soft warnings)."""
+"""
+Institution selector (flicker-free)
+- Uses a form to buffer checkbox ticks; only commits on "Add Selected"
+- Caches search results per query to reduce UI churn while typing
+- Stores selections to st.session_state.selected_entities
+"""
 
-from typing import Optional
+from __future__ import annotations
+
+import os
+import re
+from typing import List, Dict, Optional
+
 import pandas as pd
 import streamlit as st
 
-# ---------- Data load & search ----------
+PARQUET_PATH_ENV = "INSTITUTIONS_PARQUET_PATH"  # optional override
 
-@st.cache_data
-def load_institutions():
-    """Load institutions from parquet file (expected at app root)."""
-    try:
-        df = pd.read_parquet("institutions_master.parquet")
-        return df
-    except Exception as e:
-        st.error(f"Error loading institutions file: {e}")
+
+# ---------------- Cache & data loading ----------------
+
+@st.cache_data(show_spinner=False)
+def _load_parquet(path: str) -> pd.DataFrame:
+    return pd.read_parquet(path)
+
+@st.cache_data(show_spinner=False)
+def load_institutions() -> Optional[pd.DataFrame]:
+    """
+    Load institutions_master.parquet and standardize a few columns if missing.
+    Expected (flexible): openalex_id, Name, Acronym, Type, Country, City, ROR,
+                         Total Works, Avg. Works/Year (some may be absent).
+    """
+    path = os.getenv(PARQUET_PATH_ENV, "institutions_master.parquet")
+    if not os.path.exists(path):
         return None
+    df = _load_parquet(path)
 
-@st.cache_data(ttl=300)
-def search_institutions_cached(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    """Vectorized search across several name/acronym/city fields."""
-    if not query or len(query) < 2:
-        return pd.DataFrame()
+    # Normalize column names (best-effort)
+    def norm(s: str) -> str:
+        return re.sub(r"\s+", " ", str(s)).strip()
 
-    q = query.lower()
-    mask = (
-        df["display_name"].str.lower().str.contains(q, na=False, regex=False)
-        | df["display_name_alternatives"].str.lower().str.contains(q, na=False, regex=False)
-        | df["display_name_acronyms"].str.lower().str.contains(q, na=False, regex=False)
-        | df["city"].str.lower().str.contains(q, na=False, regex=False)
-    )
+    rename_map = {}
+    for c in df.columns:
+        if c.lower() == "openalex_id":
+            rename_map[c] = "openalex_id"
+        elif c.lower() in ("name", "display_name"):
+            rename_map[c] = "Name"
+        elif c.lower() in ("acronym", "short_name"):
+            rename_map[c] = "Acronym"
+        elif c.lower() == "type":
+            rename_map[c] = "Type"
+        elif c.lower() == "country":
+            rename_map[c] = "Country"
+        elif c.lower() == "city":
+            rename_map[c] = "City"
+        elif c.lower() in ("ror", "ror_id", "ror_url"):
+            rename_map[c] = "ROR"
+        elif c.lower() in ("total works", "total_works", "works_total"):
+            rename_map[c] = "Total Works"
+        elif c.lower() in ("avg. works/year", "avg_works_per_year", "avg works per year"):
+            rename_map[c] = "Avg. Works/Year"
 
-    results = df[mask]
+    if rename_map:
+        df = df.rename(columns=rename_map)
 
-    # Table for UI display (we keep openalex_id hidden)
-    display_df = pd.DataFrame(
-        {
-            "Select": False,
-            "Name": results["display_name"].values,
-            "Acronym": results["display_name_acronyms"].values,
-            "Type": results["type"].values,
-            "Country": results["country_code"].values,
-            "City": results["city"].values,
-            "ROR": results["ror_id"].apply(lambda x: f"https://ror.org/{x}" if x else ""),
-            "Total Works": results["total_works_count"].values,
-            "Avg. Works/Year": results["avg_works_per_year_2021_2023"].values,
-            "openalex_id": results["openalex_id"].values,
-        }
-    )
-    return display_df
+    # Ensure required columns exist (create dummies if missing)
+    for col in ["openalex_id", "Name"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Clean strings
+    for col in ["Name", "Acronym", "Type", "Country", "City", "ROR"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).map(lambda x: x if x != "nan" else "")
+
+    # Numeric defaults
+    if "Total Works" in df.columns:
+        df["Total Works"] = pd.to_numeric(df["Total Works"], errors="coerce").fillna(0).astype(int)
+    if "Avg. Works/Year" in df.columns:
+        df["Avg. Works/Year"] = pd.to_numeric(df["Avg. Works/Year"], errors="coerce").fillna(0.0)
+
+    return df
 
 
-# ---------- Main renderers ----------
+@st.cache_data(show_spinner=False)
+def _search_df(df: pd.DataFrame, q: str) -> pd.DataFrame:
+    """Case-insensitive substring search over a few columns."""
+    q = q.strip()
+    if not q:
+        return df.head(0)
 
-def render_institution_selector():
-    """Phase 1: Institution selection."""
-    st.header("1️⃣ Select Institutions")
+    cols = [c for c in ["Name", "Acronym", "City", "Country", "Type"] if c in df.columns]
+    if not cols:
+        return df.head(0)
 
-    # Load
-    institutions_df = load_institutions()
-    if institutions_df is None:
-        st.error("Could not load institutions data. Make sure 'institutions_master.parquet' is in the app directory.")
-        return
+    mask = False
+    qlc = q.casefold()
+    for c in cols:
+        mask = mask | df[c].astype(str).str.casefold().str.contains(qlc, na=False)
 
-    # Search
-    search_query = st.text_input(
-        "Search institutions by name, acronym, alternative names, or city:",
-        placeholder="Type at least 2 characters to search…",
-    )
+    res = df.loc[mask].copy()
 
-    if search_query:
-        results_df = search_institutions_cached(institutions_df, search_query)
+    # Light ranking: name startswith gets a small boost
+    if "Name" in res.columns:
+        res["_rank"] = res["Name"].str.casefold().str.startswith(qlc).astype(int)
+        res = res.sort_values(["_rank", "Total Works" if "Total Works" in res.columns else "Name"], ascending=[False, False])
+        res = res.drop(columns=["_rank"], errors="ignore")
 
-        if not results_df.empty:
-            st.info(f"🔊 Found {len(results_df)} matching institutions.")
+    return res
 
-            edited_df = st.data_editor(
-                results_df.drop(columns=["openalex_id"]),
-                hide_index=True,
-                use_container_width=True,
-                column_config={
-                    "Select": st.column_config.CheckboxColumn(
-                        "Select", help="Check to add institution to selection", default=False, width="small"
-                    ),
-                    "Name": st.column_config.TextColumn("Institution Name", width="large"),
-                    "ROR": st.column_config.LinkColumn("ROR", width="medium"),
-                    "Total Works": st.column_config.NumberColumn("Total Works", format="%d", width="small"),
-                    "Avg. Works/Year": st.column_config.NumberColumn("Avg. Works/Year", format="%.1f", width="small"),
-                },
-                disabled=["Name", "Acronym", "Type", "Country", "City", "ROR", "Total Works", "Avg. Works/Year"],
-                key="institution_selector",
-            )
 
-            # Add selected
-            col1, col2 = st.columns([1, 5])
-            with col1:
-                if st.button("➕ Add Selected", type="primary"):
-                    selected_rows = edited_df[edited_df["Select"] == True]
+# ---------------- UI helpers ----------------
 
-                    if not selected_rows.empty:
-                        added_count = 0
-                        for idx, row in selected_rows.iterrows():
-                            entity = {
-                                "type": "institution",
-                                "id": results_df.loc[idx, "openalex_id"],
-                                "label": row["Name"],
-                                "metadata": {
-                                    "avg_works_per_year": row["Avg. Works/Year"],
-                                },
-                            }
-                            # no cap – just prevent duplicates
-                            if not any(e["id"] == entity["id"] for e in st.session_state.get("selected_entities", [])):
-                                st.session_state.selected_entities.append(entity)
-                                added_count += 1
-
-                        if added_count > 0:
-                            st.success(f"Added {added_count} institution(s)")
-                            st.rerun()
-                        else:
-                            st.warning("All selected institutions are already in your list")
-                    else:
-                        st.warning("Please select at least one institution")
-        else:
-            st.info("No institutions found matching your search.")
-
-    # Selected list + warnings
-    display_selected_institutions()
+def _ensure_session_buffers():
+    if "pending_inst_selection" not in st.session_state:
+        st.session_state.pending_inst_selection = set()  # openalex_id
+    if "institution_search_cache" not in st.session_state:
+        st.session_state.institution_search_cache = {}   # {query -> pd.DataFrame}
+    if "selected_entities" not in st.session_state:
+        st.session_state.selected_entities = []
 
 
 def display_selected_institutions():
-    """Show selected institutions and soft warnings."""
-    # Ensure the container exists
-    st.session_state.setdefault("selected_entities", [])
-
-    institution_entities = [e for e in st.session_state.selected_entities if e["type"] == "institution"]
-
-    if not institution_entities:
-        st.info("No institutions selected yet. Search and select institutions above.")
+    """Compact summary of already chosen institutions."""
+    sel = [e for e in st.session_state.selected_entities if e.get("type") == "institution"]
+    if not sel:
+        st.info("No institutions selected yet.")
         return
 
-    st.divider()
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        st.subheader(f"📋 {len(institution_entities)} Selected Institutions")
-    with col3:
-        if st.button("🗑️ Clear All"):
-            # only remove institutions; keep other selections (e.g., authors) if any
-            st.session_state.selected_entities = [e for e in st.session_state.selected_entities if e["type"] != "institution"]
-            st.rerun()
+    st.subheader("Selected institutions")
+    for e in sel:
+        name = e.get("label", e.get("id"))
+        extra = e.get("metadata", {}).get("avg_works_per_year")
+        st.write(f"• **{name}** ({e.get('id')})" + (f" — avg works/year: {extra}" if extra is not None else ""))
 
-    # ---- Soft warnings ----
-    # 1) Many institutions
-    if len(institution_entities) > 30:
-        st.warning(
-            "You have selected more than **30 institutions**. "
-            "Retrieval can be heavy—consider filtering document types or narrowing the year range."
-        )
+    # Clear/remove buttons
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("Clear all institutions"):
+            st.session_state.selected_entities = [e for e in st.session_state.selected_entities if e.get("type") != "institution"]
+            st.success("Cleared all institutions.")
+    with c2:
+        remove_id = st.text_input("Remove by OpenAlex ID", placeholder="e.g., I123456789")
+        if remove_id and st.button("Remove institution"):
+            before = len(st.session_state.selected_entities)
+            st.session_state.selected_entities = [
+                e for e in st.session_state.selected_entities
+                if not (e.get("type") == "institution" and e.get("id") == remove_id)
+            ]
+            after = len(st.session_state.selected_entities)
+            if after < before:
+                st.success(f"Removed {remove_id}.")
 
-    # 2) Estimated total publications > 100k (avg works/year × selected year span)
-    total_avg_per_year = sum(e["metadata"].get("avg_works_per_year", 0) for e in institution_entities)
-    years_span = None
-    if "config" in st.session_state:
-        cfg = st.session_state.config
-        try:
-            years_span = int(cfg["end_year"]) - int(cfg["start_year"]) + 1
-        except Exception:
-            years_span = None
 
-    if years_span is not None and total_avg_per_year:
-        estimated_total = total_avg_per_year * years_span
-        if estimated_total > 100_000:
-            st.warning(
-                f"Estimated total publications for the current time range "
-                f"(**{years_span} years**) exceed **{estimated_total:,.0f}** "
-                f"(based on the institutions’ average output). "
-                "Consider reducing years, filtering document types, or exporting as Parquet."
+# ---------------- Main selector ----------------
+
+def render_institution_selector():
+    """Render the institution selection interface (form-buffered to avoid flicker)."""
+    _ensure_session_buffers()
+
+    st.header("1️⃣ Select Institutions")
+
+    # Load data
+    institutions_df = load_institutions()
+    if institutions_df is None:
+        st.error("Could not load institutions data. Ensure 'institutions_master.parquet' is present.")
+        return
+
+    # Search input (outside form; cached results avoid jumpiness)
+    search_query = st.text_input(
+        "Search institutions by name, acronym, type, country or city:",
+        placeholder="Type at least 2 characters…",
+        key="inst_query",
+    )
+
+    results_df = institutions_df.head(0)
+    if search_query and len(search_query.strip()) >= 2:
+        cache = st.session_state.institution_search_cache
+        if search_query not in cache:
+            cache[search_query] = _search_df(institutions_df, search_query)
+        results_df = cache[search_query]
+
+    if not results_df.empty:
+        st.info(f"🔎 Found {len(results_df)} matching institutions. Tick the ones to add, then press **Add Selected**.")
+
+        # Construct display frame with a checkbox column pre-filled from pending set
+        display_df = results_df.copy()
+
+        # Ensure existence of useful columns
+        for col in ["openalex_id", "Name", "Acronym", "Type", "Country", "City", "ROR", "Total Works", "Avg. Works/Year"]:
+            if col not in display_df.columns:
+                display_df[col] = ""
+
+        display_df.insert(0, "Select", display_df["openalex_id"].apply(lambda x: x in st.session_state.pending_inst_selection))
+
+        # Freeze interactions in a form
+        with st.form("institutions_form", clear_on_submit=False):
+            edited_df = st.data_editor(
+                display_df,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Select": st.column_config.CheckboxColumn("Select", help="Tick to add institution"),
+                    "openalex_id": st.column_config.TextColumn("OpenAlex ID", width="medium"),
+                    "Name": st.column_config.TextColumn("Institution Name", width="large"),
+                    "Acronym": st.column_config.TextColumn("Acronym", width="small"),
+                    "Type": st.column_config.TextColumn("Type", width="small"),
+                    "Country": st.column_config.TextColumn("Country", width="small"),
+                    "City": st.column_config.TextColumn("City", width="small"),
+                    "ROR": st.column_config.TextColumn("ROR", width="medium"),
+                    "Total Works": st.column_config.NumberColumn("Total Works", format="%d"),
+                    "Avg. Works/Year": st.column_config.NumberColumn("Avg. Works/Year", format="%.1f"),
+                },
+                disabled=["openalex_id", "Name", "Acronym", "Type", "Country", "City", "ROR", "Total Works", "Avg. Works/Year"],
+                key="institution_selector_editor",
             )
-    else:
-        # Optional informational line (per-year estimate), shown when Phase 2 not yet configured
-        st.info(
-            f"Estimated **per-year** output from the selected institutions: **{total_avg_per_year:,.0f}**. "
-            "Once you set the time range in step 2, we’ll warn if the total exceeds 100k."
-        )
 
-    # List selected institutions with per-item remove button
-    for i, entity in enumerate(institution_entities, start=1):
-        colL, colR = st.columns([11, 1])
-        with colL:
-            st.write(f"**{i}.** {entity['label']}")
-        with colR:
-            if st.button("❌", key=f"remove_inst_{entity['id']}", help=f"Remove {entity['label']}"):
-                st.session_state.selected_entities.remove(entity)
-                st.rerun()
+            try:
+                selected_ids = set(edited_df.loc[edited_df["Select"] == True, "openalex_id"].tolist())
+            except Exception:
+                selected_ids = set()
+            st.session_state.pending_inst_selection = selected_ids
+
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                submitted = st.form_submit_button("➕ Add Selected", type="primary")
+            with c2:
+                cleared = st.form_submit_button("Clear ticks (pending)")
+
+        if cleared:
+            st.session_state.pending_inst_selection = set()
+            st.success("Pending ticks cleared.")
+
+        if submitted:
+            added = 0
+            for oid in st.session_state.pending_inst_selection:
+                row = results_df[results_df["openalex_id"] == oid]
+                if row.empty:
+                    continue
+                r = row.iloc[0]
+                entity = {
+                    "type": "institution",
+                    "id": r["openalex_id"],
+                    "label": r["Name"] or r["openalex_id"],
+                    "metadata": {"avg_works_per_year": float(r["Avg. Works/Year"]) if "Avg. Works/Year" in r.index else None},
+                }
+                if not any(e["type"] == "institution" and e["id"] == entity["id"] for e in st.session_state.selected_entities):
+                    st.session_state.selected_entities.append(entity)
+                    added += 1
+            st.session_state.pending_inst_selection = set()
+            if added:
+                st.success(f"✅ Added {added} institution(s).")
+
+    display_selected_institutions()

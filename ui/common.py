@@ -2,15 +2,11 @@
 """
 Shared UI (Streamlit) for configuration & retrieval.
 
-Changes:
-- **Expert mode** in the sidebar to tune:
-  - requests per second (global)
-  - per-entity max workers (doc-type fan-out)
-  - parallel entities (UI-level pool)
-  - per_page (50/100/200)
-- Entity-level parallelism lives in the UI (safe main-thread updates).
-- Per-entity doc-type parallelism remains in core.processors.
-- Cursor pagination end-to-end (no 10k cap), no year chunking.
+- Center-panel configuration with a FORM (freeze while adjusting)
+- Expert Mode (RPS, per-entity workers, parallel entities, per_page)
+- Entity-level parallelism (in retrieve_publications)
+- Cursor pagination end-to-end; no year chunking
+- Back-compat wrappers so existing app imports still work
 """
 
 from __future__ import annotations
@@ -27,7 +23,7 @@ import streamlit as st
 from core.api_client import (
     get_session,
     PARALLEL_ENTITIES,
-    set_rate_limit,       # runtime RPS knob
+    set_rate_limit,
 )
 from core.processors import (
     fetch_publications_parallel,
@@ -35,7 +31,6 @@ from core.processors import (
     clean_text_field,
 )
 
-# -------------------- Constants & defaults --------------------
 
 CURRENT_YEAR = datetime.now().year
 
@@ -46,9 +41,7 @@ DOCUMENT_TYPES = [
     "supplementary-materials", "retraction",
 ]
 
-# Display names for export columns (subset elsewhere is OK)
 METADATA_FIELDS: Dict[str, str] = {
-    # Core Publication Information
     "id": "OpenAlex ID",
     "doi": "DOI",
     "display_name": "Title",
@@ -59,21 +52,15 @@ METADATA_FIELDS: Dict[str, str] = {
     "abstract_inverted_index": "Abstract",
     "has_fulltext": "Full Text Available",
     "is_retracted": "Is Retracted",
-
-    # Access Information
     "open_access.is_oa": "Is OA",
     "open_access.oa_status": "OA Status",
     "apc_paid.value_usd": "Paid APC in USD",
-
-    # Publication Source
     "primary_location.source.display_name": "Source",
     "primary_location.source.type": "Source Type",
     "primary_location.source.issn": "ISSN",
     "primary_location.source.host_organization_name": "Publisher",
     "primary_location.pdf_url": "PDF",
     "primary_location.license": "License",
-
-    # Aggregates / counts
     "cited_by_count": "Citation Count",
     "biblio.volume": "Volume",
     "biblio.issue": "Issue",
@@ -86,81 +73,126 @@ DEFAULT_METADATA = [
     "cited_by_count", "publication_date",
 ]
 
-# -------------------- Config UI helpers --------------------
 
 def ensure_defaults():
-    """Seed Streamlit session defaults used across pages."""
-    st.session_state.setdefault("selection_mode", "institutions")  # or "authors"
+    st.session_state.setdefault("selection_mode", "institutions")
     st.session_state.setdefault("selected_entities", [])
     st.session_state.setdefault("config", {
         "start_year": CURRENT_YEAR - 5,
         "end_year": CURRENT_YEAR,
-        "doc_types": [],                 # [] means "all"
+        "doc_types": [],
         "metadata": DEFAULT_METADATA.copy(),
         "language_filter": "All Languages",  # or "English Only"
-        "output_format": "Parquet",     # or "CSV"
-        # expert mode fields will be added when toggled
+        "output_format": "Parquet",          # or "CSV"
+        "expert_mode": False,
+        # expert knobs (only used when expert_mode True)
+        "requests_per_second": 8.0,
+        "max_workers": 10,
+        "parallel_entities": PARALLEL_ENTITIES,
+        "per_page": 200,
     })
 
 
-def render_config_sidebar():
-    """Render the sidebar with retrieval settings and save to st.session_state.config."""
+# ---------------- Center-panel CONFIG (form) ----------------
+
+def render_config_section():
+    """Center-panel config with a form that applies on click (avoids flicker)."""
     ensure_defaults()
     cfg = st.session_state.config
 
-    with st.sidebar:
-        st.header("⚙️ Retrieval Settings")
+    st.header("2️⃣ Configure Retrieval Parameters")
 
-        y1, y2 = st.columns(2)
-        with y1:
-            start_year = st.number_input("Start year", min_value=1900, max_value=CURRENT_YEAR, value=int(cfg["start_year"]))
-        with y2:
-            end_year = st.number_input("End year", min_value=1900, max_value=CURRENT_YEAR, value=int(cfg["end_year"]))
+    # Seed one-time form state mirrors so +/- clicks don’t live-write into cfg
+    mirrors = {
+        "cfg_start_year": cfg["start_year"],
+        "cfg_end_year": cfg["end_year"],
+        "cfg_language": cfg["language_filter"],
+        "cfg_output": cfg["output_format"],
+        "cfg_doc_types": cfg["doc_types"][:],
+        "cfg_metadata": cfg["metadata"][:],
+        "cfg_expert": bool(cfg.get("expert_mode", False)),
+        "cfg_rps": float(cfg.get("requests_per_second", 8.0)),
+        "cfg_workers": int(cfg.get("max_workers", 10)),
+        "cfg_parallel": int(cfg.get("parallel_entities", PARALLEL_ENTITIES)),
+        "cfg_per_page": int(cfg.get("per_page", 200)),
+    }
+    for k, v in mirrors.items():
+        st.session_state.setdefault(k, v)
 
-        st.markdown("**Document types** (empty = all)")
-        selected_types = st.multiselect(" ", options=DOCUMENT_TYPES, default=cfg.get("doc_types", []))
+    with st.form("config_form", clear_on_submit=False):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.number_input("Start Year", min_value=1900, max_value=CURRENT_YEAR, key="cfg_start_year")
+        with c2:
+            st.number_input("End Year", min_value=1900, max_value=CURRENT_YEAR, key="cfg_end_year")
+        with c3:
+            st.radio("Language", ["All Languages", "English Only"], key="cfg_language")
+        with c4:
+            st.radio("Output", ["Parquet", "CSV"], key="cfg_output", help="Parquet compresses better for large files")
 
-        st.markdown("**Metadata fields** (export columns)")
-        selected_metadata = st.multiselect(" ", options=list(METADATA_FIELDS.keys()), default=cfg.get("metadata", DEFAULT_METADATA))
+        st.subheader("Document Types")
+        doc_cols = st.columns(5)
+        new_doc_types = []
+        for i, dt in enumerate(DOCUMENT_TYPES):
+            with doc_cols[i % 5]:
+                if st.checkbox(dt, value=(dt in st.session_state.cfg_doc_types), key=f"cfg_doc_{dt}"):
+                    new_doc_types.append(dt)
+        st.session_state.cfg_doc_types = new_doc_types
 
-        language_filter = st.radio("Language", ["All Languages", "English Only"], index=(0 if cfg.get("language_filter") != "English Only" else 1))
-        output_format = st.radio("Output format", ["Parquet", "CSV"], index=(0 if cfg.get("output_format") != "CSV" else 1))
+        st.subheader("Metadata Fields")
+        meta_cols = st.columns(3)
+        new_meta = []
+        # Always include id
+        with meta_cols[0]:
+            st.checkbox(METADATA_FIELDS["id"], value=True, disabled=True, key="cfg_meta_id")
+            new_meta.append("id")
+        others = [k for k in METADATA_FIELDS.keys() if k != "id"]
+        for i, m in enumerate(others, start=1):
+            with meta_cols[i % 3]:
+                if st.checkbox(METADATA_FIELDS.get(m, m), value=(m in st.session_state.cfg_metadata), key=f"cfg_meta_{m}"):
+                    new_meta.append(m)
+        st.session_state.cfg_metadata = new_meta
 
-        # Persist basic config
-        cfg.update({
-            "start_year": int(start_year),
-            "end_year": int(end_year),
-            "doc_types": selected_types,
-            "metadata": selected_metadata,
-            "language_filter": language_filter,
-            "output_format": output_format,
-        })
-
-        st.caption("Tip: fewer metadata fields and Parquet output produce smaller files.")
-
-        # ---- Expert mode ----
         st.markdown("---")
-        expert = st.checkbox("Activate expert mode")
-        cfg["expert_mode"] = bool(expert)
+        st.checkbox("Activate expert mode", key="cfg_expert")
+        if st.session_state.cfg_expert:
+            e1, e2, e3, e4 = st.columns(4)
+            with e1:
+                st.slider("Requests per second", 1.0, 30.0, float(st.session_state.cfg_rps), 0.5, key="cfg_rps")
+            with e2:
+                st.slider("Max workers per entity", 1, 32, int(st.session_state.cfg_workers), key="cfg_workers")
+            with e3:
+                st.slider("Parallel entities", 1, 16, int(st.session_state.cfg_parallel), key="cfg_parallel")
+            with e4:
+                st.selectbox("Results per page", [50, 100, 200], index=[50, 100, 200].index(int(st.session_state.cfg_per_page)), key="cfg_per_page")
 
-        if expert:
-            st.caption("Tune advanced parameters. Be polite with OpenAlex: keep a valid mailto and sensible RPS.")
-            rps = st.slider("Max requests per second (global)", 1.0, 30.0, float(cfg.get("requests_per_second", 8.0)), 0.5)
-            mw  = st.slider("Max workers per entity (doc types)", 1, 32, int(cfg.get("max_workers", 10)))
-            pe  = st.slider("Parallel entities", 1, 16, int(cfg.get("parallel_entities", PARALLEL_ENTITIES)))
-            pp  = st.selectbox("Results per page", options=[50, 100, 200], index=[50, 100, 200].index(int(cfg.get("per_page", 200))))
-            cfg.update({
-                "requests_per_second": float(rps),
-                "max_workers": int(mw),
-                "parallel_entities": int(pe),
-                "per_page": int(pp),
-            })
+        applied = st.form_submit_button("Apply configuration", type="primary")
+
+    if applied:
+        # Basic validation
+        if st.session_state.cfg_start_year > st.session_state.cfg_end_year:
+            st.error("Start year cannot be after end year.")
+            return
+
+        cfg.update({
+            "start_year": int(st.session_state.cfg_start_year),
+            "end_year": int(st.session_state.cfg_end_year),
+            "language_filter": st.session_state.cfg_language,
+            "output_format": st.session_state.cfg_output,
+            "doc_types": st.session_state.cfg_doc_types[:],
+            "metadata": st.session_state.cfg_metadata[:],
+            "expert_mode": bool(st.session_state.cfg_expert),
+            "requests_per_second": float(st.session_state.cfg_rps),
+            "max_workers": int(st.session_state.cfg_workers),
+            "parallel_entities": int(st.session_state.cfg_parallel),
+            "per_page": int(st.session_state.cfg_per_page),
+        })
+        st.success("Configuration applied.")
 
 
-# -------------------- Retrieval orchestration --------------------
+# ---------------- Retrieval (unchanged logic) ----------------
 
 def _estimate_and_warn_if_large():
-    """Optional soft estimate to warn for huge downloads (institutions only)."""
     if st.session_state.get("selection_mode") != "institutions":
         return
     entities = st.session_state.get("selected_entities") or []
@@ -175,13 +207,11 @@ def _estimate_and_warn_if_large():
             f"⚠️ The file might contain more than {estimated:,.0f} publications. Consider:\n"
             "- Filtering document types\n"
             "- Selecting fewer metadata fields\n"
-            "- Removing abstracts (can save up to 40% space)\n"
-            "- Choosing Parquet format for better compression"
+            "- Removing abstracts\n"
+            "- Choosing Parquet format"
         )
 
-
 def retrieve_publications():
-    """Main retrieval entry point (entity-level parallelism + safe main-thread UI updates)."""
     ensure_defaults()
     cfg = st.session_state.config
     entities: List[Dict] = st.session_state.get("selected_entities", [])
@@ -192,9 +222,7 @@ def retrieve_publications():
         st.error("Start year cannot be after end year.")
         return
 
-    entity_label = "institutions" if st.session_state.get("selection_mode") == "institutions" else "profiles"
-
-    # Apply expert settings (if any)
+    # Apply Expert Mode parameters at runtime
     if cfg.get("expert_mode"):
         set_rate_limit(cfg.get("requests_per_second", 8.0))
         parallel_entities = cfg.get("parallel_entities", PARALLEL_ENTITIES)
@@ -205,7 +233,9 @@ def retrieve_publications():
         per_page = 200
         max_workers = None
 
-    # Top-of-page progress widgets
+    entity_label = "institutions" if st.session_state.get("selection_mode") == "institutions" else "profiles"
+
+    # Progress UI
     start_time = time.time()
     progress_bar = st.progress(0.0)
     status_placeholder = st.empty()
@@ -215,15 +245,11 @@ def retrieve_publications():
 
     _estimate_and_warn_if_large()
 
-    # One job per entity: its own pooled session
     def job(entity: Dict) -> Tuple[str, List[Dict]]:
         s = get_session()
         try:
             lang_filter = "english_only" if cfg["language_filter"] == "English Only" else "all_languages"
-            name_for_output = (
-                entity["label"] if entity.get("type") == "institution"
-                else entity.get("file_label", entity["label"])
-            )
+            name_for_output = entity["label"] if entity.get("type") == "institution" else entity.get("file_label", entity["label"])
             pubs = fetch_publications_parallel(
                 s,
                 entity["id"],
@@ -244,11 +270,9 @@ def retrieve_publications():
             except Exception:
                 pass
 
-    # Fan out entities in parallel
     all_publications: List[Dict] = []
     done = 0
     total = len(entities)
-
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     status_placeholder.info(f"Fetching: {total} {entity_label} in parallel…")
@@ -261,7 +285,6 @@ def retrieve_publications():
             done += 1
             all_publications.extend(pubs or [])
 
-            # Safe UI updates (main thread)
             progress_bar.progress(done / max(total, 1))
             metrics_placeholder.metric(
                 label="Progress",
@@ -275,7 +298,6 @@ def retrieve_publications():
     progress_bar.progress(0.9)
     status_placeholder.info("Deduplicating publications…")
 
-    # ------------- Deduplication & Export -------------
     if not all_publications:
         st.warning("No publications found for the selected criteria.")
         return
@@ -286,7 +308,6 @@ def retrieve_publications():
     gc.collect()
 
     duplicates_removed = total_before - len(merged_publications)
-
     df_output = pd.DataFrame(merged_publications)
 
     # Clean text columns
@@ -294,14 +315,14 @@ def retrieve_publications():
         if df_output[col].dtype == "object":
             df_output[col] = df_output[col].apply(lambda x: clean_text_field(x) if isinstance(x, str) else x)
 
-    # Column ordering (id first, then chosen metadata, then extracted fields if present)
+    # Column ordering
     columns_order = ["id"] + [c for c in cfg.get("metadata", DEFAULT_METADATA) if c != "id"]
-    columns_order.extend(["institutions_extracted", "authors_extracted", "position_extracted"])  # if present
+    columns_order.extend(["institutions_extracted", "authors_extracted", "position_extracted"])
     columns_order = [c for c in columns_order if c in df_output.columns]
     if columns_order:
         df_output = df_output[columns_order]
 
-    # Human-friendly column names
+    # Friendly names
     column_mapping = {field: METADATA_FIELDS.get(field, field) for field in df_output.columns}
     column_mapping.update({
         "institutions_extracted": "Institutions Extracted",
@@ -329,25 +350,29 @@ def retrieve_publications():
             mime="text/csv",
             type="primary",
         )
-    else:  # Parquet
+    else:
         filename = f"pubs_{num_entities}_{entity_type}_{timestamp}.parquet"
-        parquet_buffer = io.BytesIO()
-        df_output.to_parquet(parquet_buffer, index=False, compression="snappy")
-        parquet_data = parquet_buffer.getvalue()
-        file_size_mb = len(parquet_data) / (1024 * 1024)
-
+        import io as _io
+        pq = _io.BytesIO()
+        df_output.to_parquet(pq, index=False, compression="snappy")
+        data = pq.getvalue()
         st.success(
             f"✅ Retrieved {len(df_output):,} unique publications from {num_entities} {entity_type}. "
-            f"Removed {duplicates_removed:,} duplicates. File size: {file_size_mb:.1f} MB"
+            f"Removed {duplicates_removed:,} duplicates."
         )
         st.download_button(
             label=f"📥 Download {filename}",
-            data=parquet_data,
+            data=data,
             file_name=filename,
             mime="application/octet-stream",
             type="primary",
         )
 
-    # Final cleanup
     del df_output
     gc.collect()
+
+
+# ---- Back-compat wrapper so old imports still work ----
+def render_config_sidebar():
+    """Legacy wrapper: call the center form version."""
+    return render_config_section()
