@@ -7,7 +7,7 @@ API client utilities for OpenAlex.
 - Single polite-pool email (no rotation)
 """
 
-from typing import Optional, Dict
+from typing import Tuple, List, Dict, Any, Optional
 import requests
 import threading
 import time
@@ -110,3 +110,36 @@ def rate_limited_get(session: requests.Session, url: str, params: Optional[Dict]
             continue
         return r
     return None
+
+def set_rate_limit(new_rps: float):
+    """Dynamically adjust global RPS for the token bucket."""
+    if not new_rps or new_rps <= 0:
+        return
+    with _limiter.lock:
+        _limiter.rps = float(new_rps)
+        _limiter.tokens = min(_limiter.tokens, _limiter.rps)
+
+def fetch_works_cursor_page(
+    session: requests.Session,
+    url: str,
+    base_params: Dict[str, Any],
+    cursor: Optional[str],
+    per_page: int = 200,
+) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+    """
+    Cursor page for /works with a *forced* per_page.
+    NOTE: we *assign* per_page (not setdefault) to override any legacy value.
+    """
+    params = dict(base_params)
+    params["per_page"] = int(per_page)              # <-- force it
+    params["cursor"] = cursor if cursor else "*"
+    r = rate_limited_get(session, url, params=params, timeout=30)
+    if not r or r.status_code != 200:
+        return [], None, False
+    try:
+        data = r.json() or {}
+        results = data.get("results", []) or []
+        next_cursor = (data.get("meta") or {}).get("next_cursor")
+        return results, next_cursor, True
+    except Exception:
+        return [], None, False

@@ -1,11 +1,16 @@
-"""Shared UI components for configuration and retrieval (Streamlit)
+# ui/common.py
+"""
+Shared UI (Streamlit) for configuration & retrieval.
 
-This version switches to:
-- OpenAlex **cursor** pagination (no 10k cap)
-- Global polite rate limit handled in core.api_client
-- **Per-entity parallelism** in the UI (PARALLEL_ENTITIES)
-- **Per-doc-type/year-slice parallelism** remains in core.processors (MAX_WORKERS)
-- No Streamlit UI calls from worker threads
+Changes:
+- **Expert mode** in the sidebar to tune:
+  - requests per second (global)
+  - per-entity max workers (doc-type fan-out)
+  - parallel entities (UI-level pool)
+  - per_page (50/100/200)
+- Entity-level parallelism lives in the UI (safe main-thread updates).
+- Per-entity doc-type parallelism remains in core.processors.
+- Cursor pagination end-to-end (no 10k cap), no year chunking.
 """
 
 from __future__ import annotations
@@ -21,15 +26,16 @@ import streamlit as st
 
 from core.api_client import (
     get_session,
-    PARALLEL_ENTITIES,   # run up to N entities (institutions/authors) concurrently
+    PARALLEL_ENTITIES,
+    set_rate_limit,       # runtime RPS knob
 )
 from core.processors import (
-    fetch_publications_parallel,   # per-entity fetch (handles doc-type/year-slice fan-out + cursor)
+    fetch_publications_parallel,
     deduplicate_publications_optimized,
     clean_text_field,
 )
 
-# -------------------- Constants --------------------
+# -------------------- Constants & defaults --------------------
 
 CURRENT_YEAR = datetime.now().year
 
@@ -40,7 +46,7 @@ DOCUMENT_TYPES = [
     "supplementary-materials", "retraction",
 ]
 
-# Display names for export columns (safe to subset later)
+# Display names for export columns (subset elsewhere is OK)
 METADATA_FIELDS: Dict[str, str] = {
     # Core Publication Information
     "id": "OpenAlex ID",
@@ -75,12 +81,10 @@ METADATA_FIELDS: Dict[str, str] = {
     "biblio.last_page": "Last Page",
 }
 
-# Reasonable default subset for export
 DEFAULT_METADATA = [
     "id", "doi", "display_name", "publication_year", "type",
     "cited_by_count", "publication_date",
 ]
-
 
 # -------------------- Config UI helpers --------------------
 
@@ -88,7 +92,6 @@ def ensure_defaults():
     """Seed Streamlit session defaults used across pages."""
     st.session_state.setdefault("selection_mode", "institutions")  # or "authors"
     st.session_state.setdefault("selected_entities", [])
-
     st.session_state.setdefault("config", {
         "start_year": CURRENT_YEAR - 5,
         "end_year": CURRENT_YEAR,
@@ -96,6 +99,7 @@ def ensure_defaults():
         "metadata": DEFAULT_METADATA.copy(),
         "language_filter": "All Languages",  # or "English Only"
         "output_format": "Parquet",     # or "CSV"
+        # expert mode fields will be added when toggled
     })
 
 
@@ -117,14 +121,12 @@ def render_config_sidebar():
         selected_types = st.multiselect(" ", options=DOCUMENT_TYPES, default=cfg.get("doc_types", []))
 
         st.markdown("**Metadata fields** (export columns)")
-        selected_metadata = st.multiselect(
-            " ", options=list(METADATA_FIELDS.keys()), default=cfg.get("metadata", DEFAULT_METADATA)
-        )
+        selected_metadata = st.multiselect(" ", options=list(METADATA_FIELDS.keys()), default=cfg.get("metadata", DEFAULT_METADATA))
 
         language_filter = st.radio("Language", ["All Languages", "English Only"], index=(0 if cfg.get("language_filter") != "English Only" else 1))
         output_format = st.radio("Output format", ["Parquet", "CSV"], index=(0 if cfg.get("output_format") != "CSV" else 1))
 
-        # Persist
+        # Persist basic config
         cfg.update({
             "start_year": int(start_year),
             "end_year": int(end_year),
@@ -135,6 +137,24 @@ def render_config_sidebar():
         })
 
         st.caption("Tip: fewer metadata fields and Parquet output produce smaller files.")
+
+        # ---- Expert mode ----
+        st.markdown("---")
+        expert = st.checkbox("Activate expert mode")
+        cfg["expert_mode"] = bool(expert)
+
+        if expert:
+            st.caption("Tune advanced parameters. Be polite with OpenAlex: keep a valid mailto and sensible RPS.")
+            rps = st.slider("Max requests per second (global)", 1.0, 30.0, float(cfg.get("requests_per_second", 8.0)), 0.5)
+            mw  = st.slider("Max workers per entity (doc types)", 1, 32, int(cfg.get("max_workers", 10)))
+            pe  = st.slider("Parallel entities", 1, 16, int(cfg.get("parallel_entities", PARALLEL_ENTITIES)))
+            pp  = st.selectbox("Results per page", options=[50, 100, 200], index=[50, 100, 200].index(int(cfg.get("per_page", 200))))
+            cfg.update({
+                "requests_per_second": float(rps),
+                "max_workers": int(mw),
+                "parallel_entities": int(pe),
+                "per_page": int(pp),
+            })
 
 
 # -------------------- Retrieval orchestration --------------------
@@ -163,18 +183,27 @@ def _estimate_and_warn_if_large():
 def retrieve_publications():
     """Main retrieval entry point (entity-level parallelism + safe main-thread UI updates)."""
     ensure_defaults()
-
     cfg = st.session_state.config
     entities: List[Dict] = st.session_state.get("selected_entities", [])
     if not entities:
         st.info("Select at least one institution or author to begin.")
         return
-
     if cfg["start_year"] > cfg["end_year"]:
         st.error("Start year cannot be after end year.")
         return
 
     entity_label = "institutions" if st.session_state.get("selection_mode") == "institutions" else "profiles"
+
+    # Apply expert settings (if any)
+    if cfg.get("expert_mode"):
+        set_rate_limit(cfg.get("requests_per_second", 8.0))
+        parallel_entities = cfg.get("parallel_entities", PARALLEL_ENTITIES)
+        per_page = cfg.get("per_page", 200)
+        max_workers = cfg.get("max_workers", None)
+    else:
+        parallel_entities = PARALLEL_ENTITIES
+        per_page = 200
+        max_workers = None
 
     # Top-of-page progress widgets
     start_time = time.time()
@@ -186,13 +215,15 @@ def retrieve_publications():
 
     _estimate_and_warn_if_large()
 
-    # Prepare a job function: one session per entity
+    # One job per entity: its own pooled session
     def job(entity: Dict) -> Tuple[str, List[Dict]]:
         s = get_session()
         try:
             lang_filter = "english_only" if cfg["language_filter"] == "English Only" else "all_languages"
-            # For authors, prefer the file label ("Name, Surname"); institutions keep their label
-            name_for_output = entity["label"] if entity.get("type") == "institution" else entity.get("file_label", entity["label"])  # noqa: E501
+            name_for_output = (
+                entity["label"] if entity.get("type") == "institution"
+                else entity.get("file_label", entity["label"])
+            )
             pubs = fetch_publications_parallel(
                 s,
                 entity["id"],
@@ -203,7 +234,8 @@ def retrieve_publications():
                 cfg.get("doc_types", []),
                 cfg.get("metadata", DEFAULT_METADATA),
                 lang_filter,
-                # no callbacks — inner workers run in core; we update UI here only
+                max_workers=max_workers,
+                per_page=per_page,
             )
             return entity.get("label", "(unknown)"), pubs
         finally:
@@ -222,7 +254,7 @@ def retrieve_publications():
     status_placeholder.info(f"Fetching: {total} {entity_label} in parallel…")
     progress_bar.progress(0.02)
 
-    with ThreadPoolExecutor(max_workers=PARALLEL_ENTITIES) as ex:
+    with ThreadPoolExecutor(max_workers=parallel_entities) as ex:
         futures = [ex.submit(job, e) for e in entities]
         for fut in as_completed(futures):
             label, pubs = fut.result()
