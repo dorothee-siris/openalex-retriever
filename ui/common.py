@@ -4,7 +4,7 @@ Shared UI (Streamlit) for configuration & retrieval.
 
 - Center-panel configuration with a FORM (freeze while adjusting)
 - API parameters (experts only) section (always visible)
-- Select/Unselect all for Document types and Metadata (within the form)
+- Select/Unselect all for Document types and Metadata (within the form; unique keys)
 - Entity-level parallelism (in retrieve_publications)
 - Cursor pagination end-to-end; no year chunking
 - Phase 3 is gated by an explicit **Start retrieval** button
@@ -68,7 +68,8 @@ METADATA_FIELDS: Dict[str, str] = {
     "biblio.last_page": "Last Page",
 }
 
-DEFAULT_METADATA = list(METADATA_FIELDS.keys())  # default: all selected
+# Default = ALL metadata selected (you asked for this)
+DEFAULT_METADATA = list(METADATA_FIELDS.keys())
 
 
 def ensure_defaults():
@@ -78,10 +79,10 @@ def ensure_defaults():
         # Retrieval
         "start_year": CURRENT_YEAR - 5,
         "end_year": CURRENT_YEAR,
-        "doc_types": DOCUMENT_TYPES[:],          # UI default = all selected
-        "metadata": DEFAULT_METADATA[:],         # UI default = all selected
-        "language_filter": "All Languages",      # or "English Only"
-        "output_format": "Parquet",              # or "CSV"
+        "doc_types": DOCUMENT_TYPES[:],      # UI default = all selected
+        "metadata": DEFAULT_METADATA[:],     # UI default = all selected
+        "language_filter": "All Languages",  # or "English Only"
+        "output_format": "Parquet",          # or "CSV"
         # API params (experts only)
         "requests_per_second": 8.0,
         "max_workers": 10,
@@ -99,7 +100,7 @@ def render_config_section():
 
     st.header("2️⃣ Configure Retrieval Parameters")
 
-    # Seed one-time form state mirrors so +/- clicks don’t live-write into cfg
+    # Seed one-time form mirrors so +/- clicks don’t live-write into cfg
     mirrors = {
         "cfg_start_year": cfg["start_year"],
         "cfg_end_year": cfg["end_year"],
@@ -130,9 +131,17 @@ def render_config_section():
         st.subheader("Document types")
         dtop, dmid, dbot = st.columns([1, 2, 3])
         with dtop:
-            sel_all_dt = st.checkbox("Select all", value=(len(st.session_state.cfg_doc_types) == len(DOCUMENT_TYPES)))
+            sel_all_dt = st.checkbox(
+                "Select all",
+                key="dt_select_all",
+                value=(len(st.session_state.cfg_doc_types) == len(DOCUMENT_TYPES)),
+            )
         with dmid:
-            unsel_all_dt = st.checkbox("Unselect all", value=(len(st.session_state.cfg_doc_types) == 0))
+            unsel_all_dt = st.checkbox(
+                "Unselect all",
+                key="dt_unselect_all",
+                value=(len(st.session_state.cfg_doc_types) == 0),
+            )
         if sel_all_dt and not unsel_all_dt:
             st.session_state.cfg_doc_types = DOCUMENT_TYPES[:]
         elif unsel_all_dt and not sel_all_dt:
@@ -150,9 +159,17 @@ def render_config_section():
         st.subheader("Metadata fields")
         mtop, mmid, mbot = st.columns([1, 2, 3])
         with mtop:
-            sel_all_md = st.checkbox("Select all", value=(set(st.session_state.cfg_metadata) == set(DEFAULT_METADATA)))
+            sel_all_md = st.checkbox(
+                "Select all",
+                key="md_select_all",
+                value=(set(st.session_state.cfg_metadata) == set(DEFAULT_METADATA)),
+            )
         with mmid:
-            unsel_all_md = st.checkbox("Unselect all", value=(len(st.session_state.cfg_metadata) == 0))
+            unsel_all_md = st.checkbox(
+                "Unselect all",
+                key="md_unselect_all",
+                value=(len(st.session_state.cfg_metadata) == 0),
+            )
         if sel_all_md and not unsel_all_md:
             st.session_state.cfg_metadata = DEFAULT_METADATA[:]
         elif unsel_all_md and not sel_all_md:
@@ -162,7 +179,7 @@ def render_config_section():
         new_meta = []
         for i, m in enumerate(DEFAULT_METADATA):
             with meta_cols[i % 3]:
-                # keep id checked if present in choices
+                # keep id checked
                 default_on = (m in st.session_state.cfg_metadata) or (m == "id")
                 disabled = (m == "id")
                 if st.checkbox(METADATA_FIELDS.get(m, m), value=default_on, disabled=disabled, key=f"cfg_meta_{m}"):
@@ -280,7 +297,7 @@ def retrieve_publications():
         st.error("Start year cannot be after end year.")
         return
 
-    # Always apply API params from config
+    # Apply API params
     set_rate_limit(cfg.get("requests_per_second", 8.0))
     parallel_entities = cfg.get("parallel_entities", PARALLEL_ENTITIES)
     per_page = cfg.get("per_page", 200)

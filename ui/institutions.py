@@ -2,17 +2,17 @@
 """
 Institution selector (flicker-free)
 - Uses a form to buffer checkbox ticks; only commits on "Add Selected"
-- Caches search results per query to reduce UI churn while typing
-- Search across Name, Acronym, and Alternative names
-- Clean headers; clickable ROR link; default visible columns; option to show extra columns
-- Selected list shows avg works/year (2021–23) and a total on top
+- Accent-insensitive search across: Institution name, Alternative name(s), Acronym(s)
+- Clean results table: Institution name, Type, Country, City, ROR link, Total works, Avg works per year (2021–23)
+  • Hidden by default but revealable: OpenAlex ID, Alternative name(s), Acronym(s)
+- Selected list shows avg works/year per institution and a total on top
 """
 
 from __future__ import annotations
 
 import os
-import re
-from typing import List, Dict, Optional
+import unicodedata
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -29,95 +29,72 @@ def _load_parquet(path: str) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_institutions() -> Optional[pd.DataFrame]:
     """
-    Load institutions_master.parquet and normalize column naming.
-    We try to standardize these names:
-      - openalex_id, Name, Acronym, Type, Country, City, ROR, Total Works,
-        Avg. Works/Year, Alternative Names
+    Load the 'institutions_master.parquet' with the new, explicit headers:
+      - OpenAlex ID, Institution name, Alternative name(s), Acronym(s),
+        Type, Country, City, ROR ID, Total works, Avg works per year (2021-23)
+
+    Adds a computed 'ROR link' column (https://ror.org/<id>).
     """
     path = os.getenv(PARQUET_PATH_ENV, "institutions_master.parquet")
     if not os.path.exists(path):
         return None
-    df = _load_parquet(path)
+    df = _load_parquet(path).copy()
 
-    # Normalize columns
-    rename_map = {}
-    for c in df.columns:
-        lc = c.lower().strip()
-        if lc == "openalex_id":
-            rename_map[c] = "openalex_id"
-        elif lc in ("name", "display_name"):
-            rename_map[c] = "Name"
-        elif lc in ("acronym", "short_name"):
-            rename_map[c] = "Acronym"
-        elif lc == "type":
-            rename_map[c] = "Type"
-        elif lc == "country":
-            rename_map[c] = "Country"
-        elif lc == "city":
-            rename_map[c] = "City"
-        elif lc in ("ror", "ror_id", "ror_url"):
-            rename_map[c] = "ROR"
-        elif lc in ("total works", "total_works", "works_total"):
-            rename_map[c] = "Total Works"
-        elif lc in ("avg. works/year", "avg_works_per_year", "avg works per year"):
-            rename_map[c] = "Avg. Works/Year"
-        elif lc in ("alternative names", "name_alternatives", "aliases", "alt_names"):
-            rename_map[c] = "Alternative Names"
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    # Ensure core columns
-    for col in ["openalex_id", "Name"]:
+    # Ensure all expected columns exist
+    expected = [
+        "OpenAlex ID", "Institution name", "Alternative name(s)", "Acronym(s)",
+        "Type", "Country", "City", "ROR ID", "Total works", "Avg works per year (2021-23)"
+    ]
+    for col in expected:
         if col not in df.columns:
             df[col] = ""
 
-    # Type cleanup
-    for col in ["Name", "Acronym", "Type", "Country", "City", "ROR", "Alternative Names"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str).replace("nan", "")
+    # Numeric coercions
+    df["Total works"] = pd.to_numeric(df["Total works"], errors="coerce").fillna(0).astype(int)
+    df["Avg works per year (2021-23)"] = pd.to_numeric(
+        df["Avg works per year (2021-23)"], errors="coerce"
+    ).fillna(0.0)
 
-    if "Total Works" in df.columns:
-        df["Total Works"] = pd.to_numeric(df["Total Works"], errors="coerce").fillna(0).astype(int)
-    if "Avg. Works/Year" in df.columns:
-        df["Avg. Works/Year"] = pd.to_numeric(df["Avg. Works/Year"], errors="coerce").fillna(0.0)
+    # ROR link
+    df["ROR link"] = df["ROR ID"].astype(str).str.strip().apply(
+        lambda rid: f"https://ror.org/{rid}" if rid and rid != "nan" else ""
+    )
 
     return df
 
 
+# ---------------- Helpers ----------------
+
+def _strip_accents_lower(s: str) -> str:
+    if not isinstance(s, str):
+        s = "" if s is None else str(s)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.lower()
+
 @st.cache_data(show_spinner=False)
-def _search_df(df: pd.DataFrame, q: str) -> pd.DataFrame:
-    """Case-insensitive substring search over Name, Acronym, Alternative Names."""
-    q = q.strip()
+def _search_df(df: pd.DataFrame, raw_query: str) -> pd.DataFrame:
+    """Accent-insensitive substring search across 3 columns."""
+    q = _strip_accents_lower((raw_query or "").strip())
     if not q:
         return df.head(0)
 
-    cols = [c for c in ["Name", "Acronym", "Alternative Names"] if c in df.columns]
-    if not cols:
-        return df.head(0)
+    cols = ["Institution name", "Alternative name(s)", "Acronym(s)"]
+    # Precompute normalized columns once to make searching snappy
+    ndf = pd.DataFrame({c: df[c].astype(str).map(_strip_accents_lower) for c in cols})
 
-    qlc = q.casefold()
     mask = False
     for c in cols:
-        mask = mask | df[c].astype(str).str.casefold().str.contains(qlc, na=False)
+        mask = mask | ndf[c].str.contains(q, na=False)
 
-    res = df.loc[mask].copy()
+    return df.loc[mask].copy()
 
-    # Light ranking: name startswith gets a small boost
-    if "Name" in res.columns:
-        res["_rank"] = res["Name"].str.casefold().str.startswith(qlc).astype(int)
-        res = res.sort_values(["_rank", "Total Works" if "Total Works" in res.columns else "Name"], ascending=[False, False])
-        res = res.drop(columns=["_rank"], errors="ignore")
-
-    return res
-
-
-# ---------------- UI helpers ----------------
 
 def _ensure_session_buffers():
     if "pending_inst_selection" not in st.session_state:
-        st.session_state.pending_inst_selection = set()  # openalex_id
+        st.session_state.pending_inst_selection = set()  # OpenAlex ID
     if "institution_search_cache" not in st.session_state:
-        st.session_state.institution_search_cache = {}   # {query -> pd.DataFrame}
+        st.session_state.institution_search_cache = {}   # {query -> DataFrame}
     if "selected_entities" not in st.session_state:
         st.session_state.selected_entities = []
 
@@ -132,7 +109,7 @@ def _safe_float(x) -> float:
 
 
 def display_selected_institutions():
-    """Summary of already chosen institutions (with totals)."""
+    """Summary of chosen institutions (with total)."""
     sel = [e for e in st.session_state.selected_entities if e.get("type") == "institution"]
     if not sel:
         st.info("No institutions selected yet.")
@@ -146,23 +123,10 @@ def display_selected_institutions():
         avg = _safe_float((e.get("metadata") or {}).get("avg_works_per_year"))
         st.write(f"• **{name}** — avg works/year (2021–23): {avg:,.1f}")
 
-    # Clear/remove controls
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        if st.button("Clear all institutions"):
-            st.session_state.selected_entities = [e for e in st.session_state.selected_entities if e.get("type") != "institution"]
-            st.success("Cleared all institutions.")
-    with c2:
-        remove_id = st.text_input("Remove by OpenAlex ID", placeholder="e.g., I123456789")
-        if remove_id and st.button("Remove institution"):
-            before = len(st.session_state.selected_entities)
-            st.session_state.selected_entities = [
-                e for e in st.session_state.selected_entities
-                if not (e.get("type") == "institution" and e.get("id") == remove_id)
-            ]
-            after = len(st.session_state.selected_entities)
-            if after < before:
-                st.success(f"Removed {remove_id}.")
+    # Just a single "Clear all" control (you asked to remove 'remove by ID')
+    if st.button("Clear all institutions"):
+        st.session_state.selected_entities = [e for e in st.session_state.selected_entities if e.get("type") != "institution"]
+        st.success("Cleared all institutions.")
 
 
 # ---------------- Main selector ----------------
@@ -181,7 +145,7 @@ def render_institution_selector():
 
     # Search input (outside form; cached results avoid jumpiness)
     search_query = st.text_input(
-        "Search institutions (Name, Acronym, Alternative Names):",
+        "Search institutions (Institution name, Alternative name(s), Acronym(s)) — accent-insensitive:",
         placeholder="Type at least 2 characters…",
         key="inst_query",
     )
@@ -196,60 +160,71 @@ def render_institution_selector():
     if not results_df.empty:
         st.info(f"🔎 Found {len(results_df)} matching institutions. Tick the ones to add, then press **Add Selected**.")
 
-        # Construct display frame with a checkbox column pre-filled from pending set
+        # Build the display frame + checkbox column
         display_df = results_df.copy()
-
-        # Ensure existence of useful columns
-        for col in ["openalex_id", "Name", "Acronym", "Type", "Country", "City", "ROR", "Total Works", "Avg. Works/Year"]:
+        for col in [
+            "OpenAlex ID", "Institution name", "Alternative name(s)", "Acronym(s)",
+            "Type", "Country", "City", "ROR link", "Total works", "Avg works per year (2021-23)"
+        ]:
             if col not in display_df.columns:
                 display_df[col] = ""
 
-        display_df.insert(0, "Select", display_df["openalex_id"].apply(lambda x: x in st.session_state.pending_inst_selection))
+        # Pre-fill Select column based on pending set
+        display_df.insert(
+            0, "Select",
+            display_df["OpenAlex ID"].apply(lambda x: x in st.session_state.pending_inst_selection)
+        )
 
-        base_column_order = [
+        # Default visible columns (as requested) — hide extras by default
+        visible_cols = [
             "Select",
-            "Name",
-            "Acronym",
+            "Institution name",
+            # Acronym(s) hidden by default
             "Type",
             "Country",
             "City",
-            "ROR",
-            "Total Works",
-            "Avg. Works/Year",
-            "openalex_id",  # kept visible for reliability; you can scroll right
+            "ROR link",
+            "Total works",
+            "Avg works per year (2021-23)",
+            # "OpenAlex ID" hidden by default
         ]
+        extra_cols = ["Acronym(s)", "Alternative name(s)", "OpenAlex ID"]
 
         # Freeze interactions in a form
         with st.form("institutions_form", clear_on_submit=False):
+            show_extra = st.checkbox("Show extra columns", value=False, key="inst_show_extra")
+
+            column_order = visible_cols + (extra_cols if show_extra else [])
             edited_df = st.data_editor(
                 display_df,
                 hide_index=True,
                 use_container_width=True,
-                column_order=[c for c in base_column_order if c in display_df.columns],
+                column_order=[c for c in column_order if c in display_df.columns],
                 column_config={
                     "Select": st.column_config.CheckboxColumn("Select", help="Tick to add institution"),
-                    "Name": st.column_config.TextColumn("Institution Name", width="large"),
-                    "Acronym": st.column_config.TextColumn("Acronym", width="small"),
+                    "Institution name": st.column_config.TextColumn("Institution Name", width="large"),
+                    "Acronym(s)": st.column_config.TextColumn("Acronym(s)", width="small"),
+                    "Alternative name(s)": st.column_config.TextColumn("Alternative name(s)", width="large"),
                     "Type": st.column_config.TextColumn("Type", width="small"),
                     "Country": st.column_config.TextColumn("Country", width="small"),
                     "City": st.column_config.TextColumn("City", width="small"),
-                    "ROR": st.column_config.LinkColumn("ROR link", width="medium"),
-                    "Total Works": st.column_config.NumberColumn("Total works", format="%d"),
-                    "Avg. Works/Year": st.column_config.NumberColumn("Avg. works/year (2021–23)", format="%.1f"),
-                    "openalex_id": st.column_config.TextColumn("OpenAlex ID", width="medium"),
+                    "ROR link": st.column_config.LinkColumn("ROR link", width="medium"),
+                    "Total works": st.column_config.NumberColumn("Total works", format="%d"),
+                    "Avg works per year (2021-23)": st.column_config.NumberColumn("Avg works/year (2021–23)", format="%.1f"),
+                    "OpenAlex ID": st.column_config.TextColumn("OpenAlex ID", width="medium"),
                 },
-                disabled=["Name", "Acronym", "Type", "Country", "City", "ROR", "Total Works", "Avg. Works/Year", "openalex_id"],
+                disabled=[
+                    "Institution name", "Acronym(s)", "Alternative name(s)", "Type", "Country", "City",
+                    "ROR link", "Total works", "Avg works per year (2021-23)", "OpenAlex ID"
+                ],
                 key="institution_selector_editor",
             )
 
             try:
-                selected_ids = set(edited_df.loc[edited_df["Select"] == True, "openalex_id"].tolist())
+                selected_ids = set(edited_df.loc[edited_df["Select"] == True, "OpenAlex ID"].tolist())
             except Exception:
                 selected_ids = set()
             st.session_state.pending_inst_selection = selected_ids
-
-            # Optional: extra columns
-            show_extra = st.checkbox("Show extra columns", value=False, key="inst_show_extra")
 
             c1, c2 = st.columns([1, 2])
             with c1:
@@ -264,15 +239,17 @@ def render_institution_selector():
         if submitted:
             added = 0
             for oid in st.session_state.pending_inst_selection:
-                row = results_df[results_df["openalex_id"] == oid]
+                row = results_df[results_df["OpenAlex ID"] == oid]
                 if row.empty:
                     continue
                 r = row.iloc[0]
                 entity = {
                     "type": "institution",
-                    "id": r["openalex_id"],
-                    "label": r["Name"] or r["openalex_id"],
-                    "metadata": {"avg_works_per_year": float(r["Avg. Works/Year"]) if "Avg. Works/Year" in r.index else None},
+                    "id": r["OpenAlex ID"],
+                    "label": r["Institution name"] or r["OpenAlex ID"],
+                    "metadata": {
+                        "avg_works_per_year": float(r["Avg works per year (2021-23)"]) if "Avg works per year (2021-23)" in r.index else None
+                    },
                 }
                 if not any(e["type"] == "institution" and e["id"] == entity["id"] for e in st.session_state.selected_entities):
                     st.session_state.selected_entities.append(entity)
@@ -280,9 +257,5 @@ def render_institution_selector():
             st.session_state.pending_inst_selection = set()
             if added:
                 st.success(f"✅ Added {added} institution(s).")
-
-        # Show extra columns (optional view-only table)
-        if st.session_state.get("inst_show_extra"):
-            st.dataframe(results_df, use_container_width=True)
 
     display_selected_institutions()
