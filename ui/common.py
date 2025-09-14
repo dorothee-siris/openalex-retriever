@@ -6,7 +6,7 @@ Shared UI (Streamlit) for configuration & retrieval.
 - Expert Mode (RPS, per-entity workers, parallel entities, per_page)
 - Entity-level parallelism (in retrieve_publications)
 - Cursor pagination end-to-end; no year chunking
-- Back-compat wrappers so existing app imports still work
+- Phase 3 is gated by an explicit **Start retrieval** button
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ from core.processors import (
     deduplicate_publications_optimized,
     clean_text_field,
 )
-
 
 CURRENT_YEAR = datetime.now().year
 
@@ -164,7 +163,12 @@ def render_config_section():
             with e3:
                 st.slider("Parallel entities", 1, 16, int(st.session_state.cfg_parallel), key="cfg_parallel")
             with e4:
-                st.selectbox("Results per page", [50, 100, 200], index=[50, 100, 200].index(int(st.session_state.cfg_per_page)), key="cfg_per_page")
+                st.selectbox(
+                    "Results per page",
+                    [50, 100, 200],
+                    index=[50, 100, 200].index(int(st.session_state.cfg_per_page)),
+                    key="cfg_per_page",
+                )
 
         applied = st.form_submit_button("Apply configuration", type="primary")
 
@@ -190,7 +194,26 @@ def render_config_section():
         st.success("Configuration applied.")
 
 
-# ---------------- Retrieval (unchanged logic) ----------------
+# ---------------- Retrieval gating (Phase 3) ----------------
+
+def render_retrieval_section():
+    """Phase 3: gated by an explicit button; no automatic start."""
+    ensure_defaults()
+    entities: List[Dict] = st.session_state.get("selected_entities", [])
+    st.header("3️⃣ Retrieve Publications")
+    if not entities:
+        st.info("Select at least one institution or author in Phase 1.")
+        return
+
+    st.write(f"**Selected entities:** {len(entities)}")
+    start = st.button("▶️ Start retrieval", type="primary")
+    if start:
+        retrieve_publications()
+    else:
+        st.info("Adjust configuration above, then press **Start retrieval** to begin.")
+
+
+# ---------------- Retrieval core ----------------
 
 def _estimate_and_warn_if_large():
     if st.session_state.get("selection_mode") != "institutions":
@@ -352,8 +375,7 @@ def retrieve_publications():
         )
     else:
         filename = f"pubs_{num_entities}_{entity_type}_{timestamp}.parquet"
-        import io as _io
-        pq = _io.BytesIO()
+        pq = io.BytesIO()
         df_output.to_parquet(pq, index=False, compression="snappy")
         data = pq.getvalue()
         st.success(
@@ -370,9 +392,3 @@ def retrieve_publications():
 
     del df_output
     gc.collect()
-
-
-# ---- Back-compat wrapper so old imports still work ----
-def render_config_sidebar():
-    """Legacy wrapper: call the center form version."""
-    return render_config_section()

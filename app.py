@@ -6,7 +6,7 @@ import streamlit as st
 from ui.landing import show_landing_page
 from ui.institutions import render_institution_selector
 from ui.authors import render_author_selector
-from ui.common import render_config_sidebar, retrieve_publications  # ⬅️ updated names
+from ui.common import render_config_section, render_retrieval_section  # ⬅️ gated Phase 3
 
 # Constants
 MAILTO = "theodore.hervieux@sirisacademic.com"
@@ -39,7 +39,6 @@ def main():
         if st.button("↩️ Switch Method", help="Go back to method selection"):
             st.session_state.selection_mode = None
             st.session_state.selected_entities = []
-            # clean any transient state
             for k in ("author_candidates", "config"):
                 if k in st.session_state:
                     del st.session_state[k]
@@ -59,11 +58,11 @@ def main():
     if st.session_state.selected_entities:
         st.divider()
         # Phase 2: Configure Retrieval Parameters (shared)
-        render_config_sidebar()
+        render_config_section()
 
         st.divider()
-        # Phase 3: Retrieve Publications (shared)
-        retrieve_publications()
+        # Phase 3: Retrieve Publications (gated by button)
+        render_retrieval_section()
 
 
 if __name__ == "__main__":

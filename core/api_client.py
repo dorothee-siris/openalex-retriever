@@ -6,7 +6,6 @@ API client utilities for OpenAlex.
 - Simple 429 backoff
 - Single polite-pool email (no rotation)
 """
-
 from typing import Tuple, List, Dict, Any, Optional
 import requests
 import threading
@@ -17,43 +16,6 @@ MAILTO = "theodore.hervieux@sirisacademic.com"
 REQUESTS_PER_SECOND = 8          # global polite rate
 MAX_WORKERS = 10                 # threads for slices/doc_types per entity
 PARALLEL_ENTITIES = 5            # run up to N institutions/authors at once
-
-
-# ---- helpers ----
-
-def search_author_by_name(session: requests.Session, first_name: str, last_name: str):
-    url = "https://api.openalex.org/authors"
-    params = {"search": f"{first_name} {last_name}", "per_page": 50}
-    r = rate_limited_get(session, url, params=params, timeout=30)
-    if not r or r.status_code != 200:
-        return []
-    try:
-        return (r.json() or {}).get("results", []) or []
-    except Exception:
-        return []
-    
-from typing import Tuple, List, Dict, Any, Optional
-
-
-def fetch_works_cursor_page(
-    session: requests.Session, url: str, base_params: Dict[str, Any], cursor: Optional[str]
-) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
-    # mailto is injected inside rate_limited_get
-    params = dict(base_params)
-    params.setdefault("per_page", 200)
-    params["cursor"] = cursor if cursor is not None else "*"
-
-    r = rate_limited_get(session, url, params=params, timeout=30)
-    if not r or r.status_code != 200:
-        return [], None, False
-    try:
-        data = r.json() or {}
-        results = data.get("results", []) or []
-        next_cursor = (data.get("meta") or {}).get("next_cursor")
-        return results, next_cursor, True
-    except Exception:
-        return [], None, False
-
 
 # ---- Token-bucket limiter ----
 class RateLimiter:
@@ -79,6 +41,14 @@ class RateLimiter:
 
 _limiter = RateLimiter(REQUESTS_PER_SECOND)
 
+def set_rate_limit(new_rps: float):
+    """Dynamically adjust global RPS for the token bucket."""
+    if not new_rps or new_rps <= 0:
+        return
+    with _limiter.lock:
+        _limiter.rps = float(new_rps)
+        _limiter.tokens = min(_limiter.tokens, _limiter.rps)
+
 def get_session() -> requests.Session:
     """Shared session with connection pooling and retries."""
     s = requests.Session()
@@ -88,7 +58,12 @@ def get_session() -> requests.Session:
     s.mount("https://", adapter)
     return s
 
-def rate_limited_get(session: requests.Session, url: str, params: Optional[Dict] = None, timeout=30) -> Optional[requests.Response]:
+def rate_limited_get(
+    session: requests.Session,
+    url: str,
+    params: Optional[Dict] = None,
+    timeout: int = 30
+) -> Optional[requests.Response]:
     """Global-throttled GET with small retry/backoff on 429/network errors."""
     if params is None:
         params = {}
@@ -111,13 +86,19 @@ def rate_limited_get(session: requests.Session, url: str, params: Optional[Dict]
         return r
     return None
 
-def set_rate_limit(new_rps: float):
-    """Dynamically adjust global RPS for the token bucket."""
-    if not new_rps or new_rps <= 0:
-        return
-    with _limiter.lock:
-        _limiter.rps = float(new_rps)
-        _limiter.tokens = min(_limiter.tokens, _limiter.rps)
+# ---- helpers ----
+
+def search_author_by_name(session: requests.Session, first_name: str, last_name: str) -> List[Dict[str, Any]]:
+    """Lightweight /authors search (name only). Returns raw 'results' list."""
+    url = "https://api.openalex.org/authors"
+    params = {"search": f"{first_name} {last_name}", "per_page": 50}
+    r = rate_limited_get(session, url, params=params, timeout=30)
+    if not r or r.status_code != 200:
+        return []
+    try:
+        return (r.json() or {}).get("results", []) or []
+    except Exception:
+        return []
 
 def fetch_works_cursor_page(
     session: requests.Session,
@@ -127,11 +108,12 @@ def fetch_works_cursor_page(
     per_page: int = 200,
 ) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
     """
-    Cursor page for /works with a *forced* per_page.
-    NOTE: we *assign* per_page (not setdefault) to override any legacy value.
+    Fetch one **cursor** page from /works.
+    - Forces per_page (OpenAlex max=200)
+    - Injects cursor="*" for the first page
     """
     params = dict(base_params)
-    params["per_page"] = int(per_page)              # <-- force it
+    params["per_page"] = int(per_page)
     params["cursor"] = cursor if cursor else "*"
     r = rate_limited_get(session, url, params=params, timeout=30)
     if not r or r.status_code != 200:

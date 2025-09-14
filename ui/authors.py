@@ -198,6 +198,11 @@ def prefetch_author_candidates_parallel(df: pd.DataFrame, surname_col: str, name
     status.success(f"✅ Found candidates for {len(st.session_state.author_candidates)} authors")
     progress.empty()
     status.empty()
+    for s in sessions:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 # ---------- Render functions ----------
